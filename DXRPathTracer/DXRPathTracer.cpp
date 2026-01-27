@@ -54,6 +54,8 @@ StaticAssert_(ArraySize_(SceneCameraPositions) == uint64(Scenes::NumValues));
 StaticAssert_(ArraySize_(SceneCameraRotations) == uint64(Scenes::NumValues));
 StaticAssert_(ArraySize_(SceneSunDirections) == uint64(Scenes::NumValues));
 
+int g_render_path = 0;  // 0=DXR1.0; 1=DXR1.1 recursion, 2=DXR1.1 loop
+
 static const uint64 NumConeSides = 16;
 
 static const bool Benchmark = false;
@@ -719,6 +721,10 @@ void DXRPathTracer::InitRayTracing()
     }
 
     rtCurrCamera = camera;
+
+    // RayQuery ver
+    rayTraceRayQueryCS = CompileFromFile(L"RayTrace_rayquery.hlsl", nullptr, ShaderType::Compute);
+    rayTraceRayQuery1CS = CompileFromFile(L"RayTrace_rayquery_1.hlsl", nullptr, ShaderType::Compute);
 }
 
 void DXRPathTracer::CreateRayTracingPSOs()
@@ -858,6 +864,17 @@ void DXRPathTracer::CreateRayTracingPSOs()
     }
 
     DX12::Release(psoProps);
+
+    // RayQuery PSOs
+    {
+      D3D12_COMPUTE_PIPELINE_STATE_DESC cpsd{};
+      cpsd.pRootSignature = rtRootSignature;
+      cpsd.CS = rayTraceRayQueryCS.ByteCode();
+      DXCall(DX12::Device->CreateComputePipelineState(&cpsd, IID_PPV_ARGS(&rtRayQueryPSO)));
+
+      cpsd.CS = rayTraceRayQuery1CS.ByteCode();
+      DXCall(DX12::Device->CreateComputePipelineState(&cpsd, IID_PPV_ARGS(&rtRayQuery1PSO)));
+    }
 }
 
 void DXRPathTracer::Update(const Timer& timer)
@@ -936,6 +953,12 @@ void DXRPathTracer::Update(const Timer& timer)
         CreatePSOs();
 
         rtShouldRestartPathTrace = true;
+    }
+
+    static int last_render_path{ 0 };
+    if (last_render_path != g_render_path) {
+      rtShouldRestartPathTrace = true;
+      last_render_path = g_render_path;
     }
 
     const Setting* settingsToCheck[] =
@@ -1351,17 +1374,36 @@ void DXRPathTracer::RenderRayTracing()
 
     rtTarget.MakeWritableUAV(cmdList);
 
-    cmdList->SetPipelineState1(rtPSO);
-
-    D3D12_DISPATCH_RAYS_DESC dispatchDesc = {};
-    dispatchDesc.HitGroupTable = rtHitTable.ShaderTable();
-    dispatchDesc.MissShaderTable = rtMissTable.ShaderTable();
-    dispatchDesc.RayGenerationShaderRecord = rtRayGenTable.ShaderRecord(0);
-    dispatchDesc.Width = uint32(rtTarget.Width());
-    dispatchDesc.Height = uint32(rtTarget.Height());
-    dispatchDesc.Depth = 1;
-
-    DX12::CmdList->DispatchRays(&dispatchDesc);
+    switch (g_render_path) {
+    case 0: {
+      cmdList->SetPipelineState1(rtPSO);
+      D3D12_DISPATCH_RAYS_DESC dispatchDesc = {};
+      dispatchDesc.HitGroupTable = rtHitTable.ShaderTable();
+      dispatchDesc.MissShaderTable = rtMissTable.ShaderTable();
+      dispatchDesc.RayGenerationShaderRecord = rtRayGenTable.ShaderRecord(0);
+      dispatchDesc.Width = uint32(rtTarget.Width());
+      dispatchDesc.Height = uint32(rtTarget.Height());
+      dispatchDesc.Depth = 1;
+      DX12::CmdList->DispatchRays(&dispatchDesc);
+      break;
+    }
+    case 1: {
+      cmdList->SetPipelineState(rtRayQueryPSO);
+      uint32_t gx, gy;
+      gx = static_cast<uint32_t>(rtTarget.Width() - 1) / 8 + 1;
+      gy = static_cast<uint32_t>(rtTarget.Height() - 1) / 8 + 1;
+      DX12::CmdList->Dispatch(gx, gy, 1);
+      break;
+    }
+    case 2: {
+      cmdList->SetPipelineState(rtRayQuery1PSO);
+      uint32_t gx, gy;
+      gx = static_cast<uint32_t>(rtTarget.Width() - 1) / 8 + 1;
+      gy = static_cast<uint32_t>(rtTarget.Height() - 1) / 8 + 1;
+      DX12::CmdList->Dispatch(gx, gy, 1);
+      break;
+    }
+    }
 
     rtTarget.MakeReadableUAV(cmdList);
 
@@ -1447,6 +1489,8 @@ void DXRPathTracer::BuildRTAccelerationStructure()
 
     const uint32 numGeometries = uint32(geometryDescs.Size());
     Array<GeometryInfo> geoInfoBufferData(numGeometries);
+
+    printf("[BuildRTAccelerationStructure] %u geoms\n", numGeometries);
 
     for(uint64 meshIdx = 0; meshIdx < numMeshes; ++meshIdx)
     {
@@ -1598,6 +1642,10 @@ void DXRPathTracer::BuildRTAccelerationStructure()
 
 int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLine, int nCmdShow)
 {
+    AllocConsole();
+    freopen_s((FILE**)stdin, "CONIN$", "r", stderr);
+    freopen_s((FILE**)stdout, "CONOUT$", "w", stdout);
+    freopen_s((FILE**)stderr, "CONOUT$", "w", stderr);
     DXRPathTracer app(lpCmdLine);
     app.Run();
 }

@@ -92,6 +92,11 @@ protected:
     bool rtShouldRestartPathTrace = false;
     uint32 rtCurrSampleIdx = 0;
 
+    // Something else
+    CompiledShaderPtr rayTraceRayQueryCS;
+    ID3D12PipelineState* rtRayQueryPSO{};
+    CompiledShaderPtr rayTraceRayQuery1CS;
+    ID3D12PipelineState* rtRayQuery1PSO{};
 
     virtual void Initialize() override;
     virtual void Shutdown() override;

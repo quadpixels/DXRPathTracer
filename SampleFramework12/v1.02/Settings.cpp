@@ -15,6 +15,8 @@
 #include "ImGuiHelper.h"
 #include "ImGui/imgui.h"
 
+extern int g_render_path;
+
 namespace SampleFramework12
 {
 
@@ -852,6 +854,11 @@ void SettingsContainer::Update(uint32 displayWidth, uint32 displayHeight, const 
         ImGui::End();
         return;
     }
+
+    ImGui::Text("Render Path");
+    ImGui::RadioButton("DXR1.0", &g_render_path, 0);
+    ImGui::RadioButton("DXR1.1 (template recursion)", &g_render_path, 1);
+    ImGui::RadioButton("DXR1.1 (loop-based)", &g_render_path, 2);
 
     for(uint64 groupIdx = 0; groupIdx < groups.Count(); ++groupIdx)
     {
