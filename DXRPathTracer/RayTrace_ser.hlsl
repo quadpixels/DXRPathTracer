@@ -1,7 +1,5 @@
 //=================================================================================================
 //
-//  Modified to make use of DXR 1.1 (RayQuery). Template-based recursion flavor.
-//
 //  DXR Path Tracer
 //  by MJP
 //  http://mynameismjp.wordpress.com/
@@ -23,7 +21,9 @@
 #include "SharedTypes.h"
 #include "AppSettings.hlsl"
 
-#define RECURSION_LIMIT 7
+#ifdef USE_SER
+
+#endif
 
 struct RayTraceConstants
 {
@@ -46,6 +46,8 @@ struct RayTraceConstants
     uint MaterialBufferIdx;
     uint SkyTextureIdx;
     uint NumLights;
+    
+    uint myFlags;
 };
 
 struct LightConstants
@@ -65,19 +67,27 @@ SamplerState MeshSampler : register(s0);
 SamplerState LinearSampler : register(s1);
 
 typedef BuiltInTriangleIntersectionAttributes HitAttributes;
+#ifdef USE_SER
+struct [raypayload] PrimaryPayload
+#else
 struct PrimaryPayload
+#endif
 {
-    float3 Radiance;
-    float Roughness;
-    uint PathLength;
-    uint PixelIdx;
-    uint SampleSetIdx;
-    uint IsDiffuse;
+    float3 Radiance: write(caller, closesthit, miss) : read(caller, closesthit, miss);
+    float Roughness: write(caller) : read(closesthit);
+    uint PathLength: write(caller) : read(closesthit, miss);
+    uint PixelIdx: write(caller) : read(closesthit);
+    uint SampleSetIdx: write(caller) : read(closesthit);
+    uint IsDiffuse: write(caller) : read(closesthit);
 };
 
+#ifdef USE_SER
+struct [raypayload] ShadowPayload
+#else
 struct ShadowPayload
+#endif
 {
-    float Visibility;
+    float Visibility: write(caller, closesthit, miss) : read(caller);
 };
 
 enum RayTypes {
@@ -87,38 +97,6 @@ enum RayTypes {
     NumRayTypes
 };
 
-// Loops up the vertex data for the hit triangle and interpolates its attributes
-MeshVertex GetHitSurface(in HitAttributes attr, in uint geometryIdx, in uint primIdx)
-{
-    float3 barycentrics = float3(1 - attr.barycentrics.x - attr.barycentrics.y, attr.barycentrics.x, attr.barycentrics.y);
-
-    StructuredBuffer<GeometryInfo> geoInfoBuffer = ResourceDescriptorHeap[RayTraceCB.GeometryInfoBufferIdx];
-    const GeometryInfo geoInfo = geoInfoBuffer[geometryIdx];
-
-    StructuredBuffer<MeshVertex> vtxBuffer = ResourceDescriptorHeap[RayTraceCB.VtxBufferIdx];
-    Buffer<uint> idxBuffer = ResourceDescriptorHeap[RayTraceCB.IdxBufferIdx];
-
-    const uint idx0 = idxBuffer[primIdx * 3 + geoInfo.IdxOffset + 0];
-    const uint idx1 = idxBuffer[primIdx * 3 + geoInfo.IdxOffset + 1];
-    const uint idx2 = idxBuffer[primIdx * 3 + geoInfo.IdxOffset + 2];
-
-    const MeshVertex vtx0 = vtxBuffer[idx0 + geoInfo.VtxOffset];
-    const MeshVertex vtx1 = vtxBuffer[idx1 + geoInfo.VtxOffset];
-    const MeshVertex vtx2 = vtxBuffer[idx2 + geoInfo.VtxOffset];
-
-    return BarycentricLerp(vtx0, vtx1, vtx2, barycentrics);
-}
-
-// Gets the material assigned to a geometry in the acceleration structure
-Material GetGeometryMaterial(in uint geometryIdx)
-{
-    StructuredBuffer<GeometryInfo> geoInfoBuffer = ResourceDescriptorHeap[RayTraceCB.GeometryInfoBufferIdx];
-    const GeometryInfo geoInfo = geoInfoBuffer[geometryIdx];
-
-    StructuredBuffer<Material> materialBuffer = ResourceDescriptorHeap[RayTraceCB.MaterialBufferIdx];
-    return materialBuffer[geoInfo.MaterialIdx];
-}
-
 static float2 SamplePoint(in uint pixelIdx, inout uint setIdx)
 {
     const uint permutation = setIdx * RayTraceCB.TotalNumPixels + pixelIdx;
@@ -126,65 +104,95 @@ static float2 SamplePoint(in uint pixelIdx, inout uint setIdx)
     return SampleCMJ2D(RayTraceCB.CurrSampleIdx, AppSettings.SqrtNumSamples, AppSettings.SqrtNumSamples, permutation);
 }
 
-void MissShader(in float3 world_rd, inout PrimaryPayload payload)
+[shader("raygeneration")]
+void RaygenShader()
 {
-    if (AppSettings.EnableWhiteFurnaceMode)
-    {
-        payload.Radiance = 1.0.xxx;
-    }
-    else
-    {
-        const float3 rayDir = world_rd;
+    const uint2 pixelCoord = DispatchRaysIndex().xy;
+    const uint pixelIdx = pixelCoord.y * DispatchRaysDimensions().x + pixelCoord.x;
+    
+    uint sampleSetIdx = 0;
 
-        TextureCube skyTexture = ResourceDescriptorHeap[RayTraceCB.SkyTextureIdx];
-        payload.Radiance = AppSettings.EnableSky ? skyTexture.SampleLevel(LinearSampler, rayDir, 0.0f).xyz : 0.0.xxx;
+    // Form a primary ray by un-projecting the pixel coordinate using the inverse view * projection matrix
+    float2 primaryRaySample = SamplePoint(pixelIdx, sampleSetIdx);
 
-        if (payload.PathLength == 1)
-        {
-            float cosSunAngle = dot(rayDir, RayTraceCB.SunDirectionWS);
-            if (cosSunAngle >= RayTraceCB.CosSunAngularRadius)
-                payload.Radiance = RayTraceCB.SunRenderColor;
-        }
+    float2 rayPixelPos = pixelCoord + primaryRaySample;
+    float2 ncdXY = (rayPixelPos / (DispatchRaysDimensions().xy * 0.5f)) - 1.0f;
+    ncdXY.y *= -1.0f;
+    float4 rayStart = mul(float4(ncdXY, 0.0f, 1.0f), RayTraceCB.InvViewProjection);
+    float4 rayEnd = mul(float4(ncdXY, 1.0f, 1.0f), RayTraceCB.InvViewProjection);
+
+    rayStart.xyz /= rayStart.w;
+    rayEnd.xyz /= rayEnd.w;
+    float3 rayDir = normalize(rayEnd.xyz - rayStart.xyz);
+    float rayLength = length(rayEnd.xyz - rayStart.xyz);
+
+    // Trace a primary ray
+    RayDesc ray;
+    ray.Origin = rayStart.xyz;
+    ray.Direction = rayDir;
+    ray.TMin = 0.0f;
+    ray.TMax = rayLength;
+
+    PrimaryPayload payload;
+    payload.Radiance = 0.0f;
+    payload.Roughness = 0.0f;
+    payload.PathLength = 1;
+    payload.PixelIdx = pixelIdx;
+    payload.SampleSetIdx = sampleSetIdx;
+    payload.IsDiffuse = false;
+
+    uint traceRayFlags = 0;
+
+    // Stop using the any-hit shader once we've hit the max path length, since it's *really* expensive
+    if(payload.PathLength > AppSettings.MaxAnyHitPathLength)
+        traceRayFlags = RAY_FLAG_FORCE_OPAQUE;
+
+    const uint hitGroupOffset = RayTypeRadiance;
+    const uint hitGroupGeoMultiplier = NumRayTypes;
+    const uint missShaderIdx = RayTypeRadiance;
+    
+    #ifdef USE_SER
+    if (RayTraceCB.myFlags & 1) {
+        dx::HitObject hit = dx::HitObject::TraceRay(Scene, traceRayFlags, 0xFFFFFFFF, hitGroupOffset, hitGroupGeoMultiplier, missShaderIdx, ray, payload);
+        int sortKey = hit.GetGeometryIndex() | (hit.GetPrimitiveIndex() << 16);
+        dx::MaybeReorderThread(sortKey, 1);
+        dx::HitObject::Invoke(hit, payload);
+    } else {
+        TraceRay(Scene, traceRayFlags, 0xFFFFFFFF, hitGroupOffset, hitGroupGeoMultiplier, missShaderIdx, ray, payload);
     }
+    #else
+    TraceRay(Scene, traceRayFlags, 0xFFFFFFFF, hitGroupOffset, hitGroupGeoMultiplier, missShaderIdx, ray, payload);
+    #endif
+    
+    payload.Radiance = clamp(payload.Radiance, 0.0f, FP16Max);
+
+    // Update the progressive result with the new radiance sample
+    const float lerpFactor = RayTraceCB.CurrSampleIdx / (RayTraceCB.CurrSampleIdx + 1.0f);
+    float3 newSample = payload.Radiance;
+    float3 currValue = RenderTarget[pixelCoord].xyz;
+    float3 newValue = lerp(newSample, currValue, lerpFactor);
+
+    RenderTarget[pixelCoord] = float4(newValue, 1.0f);
 }
 
-void ShadowMissShader(inout ShadowPayload payload)
-{
-    payload.Visibility = 1.0f;
-}
-
-template<uint Depth>
-void MyTracePrimaryRay(uint traceRayFlags, uint instanceInclFlags,
-    uint hitGroupOffset,
-    uint hitGroupGeoMultiplier,
-    uint missShaderIdx,
-    RayDesc ray, inout PrimaryPayload payload);
-
-void MyTraceShadowRay(uint traceRayFlags, uint instanceInclFlags,
-    uint hitGroupOffset,
-    uint hitGroupGeoMultiplier,
-    uint missShaderIdx,
-    RayDesc ray, inout ShadowPayload payload);
-
-template<uint Depth>
-float3 PathTrace(in MeshVertex hitSurface, in Material material, in PrimaryPayload inPayload, float3 world_ro, float3 world_rd)
-{
-    if ((!AppSettings.EnableDiffuse && !AppSettings.EnableSpecular) ||
+static float3 PathTrace(in MeshVertex hitSurface, in Material material, in PrimaryPayload inPayload)
+{   
+    if((!AppSettings.EnableDiffuse && !AppSettings.EnableSpecular) ||
         (!AppSettings.EnableDirect && !AppSettings.EnableIndirect))
         return 0.0.xxx;
 
-    if (inPayload.PathLength > 1 && !AppSettings.EnableIndirect)
+    if(inPayload.PathLength > 1 && !AppSettings.EnableIndirect)
         return 0.0.xxx;
-
+    
     float3x3 tangentToWorld = float3x3(hitSurface.Tangent, hitSurface.Bitangent, hitSurface.Normal);
 
     const float3 positionWS = hitSurface.Position;
 
-    const float3 incomingRayOriginWS = world_ro;
-    const float3 incomingRayDirWS = world_rd;
+    const float3 incomingRayOriginWS = WorldRayOrigin();
+    const float3 incomingRayDirWS = WorldRayDirection();
 
     float3 normalWS = hitSurface.Normal;
-    if (AppSettings.EnableNormalMaps)
+    if(AppSettings.EnableNormalMaps)
     {
         // Sample the normal map, and convert the normal to world space
         Texture2D normalMap = ResourceDescriptorHeap[NonUniformResourceIndex(material.Normal)];
@@ -196,21 +204,21 @@ float3 PathTrace(in MeshVertex hitSurface, in Material material, in PrimaryPaylo
 
         tangentToWorld._31_32_33 = normalWS;
     }
-
+    
     float3 baseColor = 1.0f;
-    if (AppSettings.EnableAlbedoMaps && !AppSettings.EnableWhiteFurnaceMode)
+    if(AppSettings.EnableAlbedoMaps && !AppSettings.EnableWhiteFurnaceMode)
     {
         Texture2D albedoMap = ResourceDescriptorHeap[NonUniformResourceIndex(material.Albedo)];
         baseColor = albedoMap.SampleLevel(MeshSampler, hitSurface.UV, 0.0f).xyz;
     }
-
+    
     Texture2D metallicMap = ResourceDescriptorHeap[NonUniformResourceIndex(material.Metallic)];
     const float metallic = saturate((AppSettings.EnableWhiteFurnaceMode ? 1.0f : metallicMap.SampleLevel(MeshSampler, hitSurface.UV, 0.0f).x) * AppSettings.MetallicScale);
 
     const bool enableDiffuse = (AppSettings.EnableDiffuse && metallic < 1.0f) || AppSettings.EnableWhiteFurnaceMode;
     const bool enableSpecular = (AppSettings.EnableSpecular && (AppSettings.EnableIndirectSpecular ? !(AppSettings.AvoidCausticPaths && inPayload.IsDiffuse) : (inPayload.PathLength == 1)));
 
-    if (enableDiffuse == false && enableSpecular == false)
+    if(enableDiffuse == false && enableSpecular == false)
         return 0.0f;
 
     Texture2D roughnessMap = ResourceDescriptorHeap[NonUniformResourceIndex(material.Roughness)];
@@ -219,11 +227,11 @@ float3 PathTrace(in MeshVertex hitSurface, in Material material, in PrimaryPaylo
     const float3 diffuseAlbedo = lerp(baseColor, 0.0f, metallic) * (enableDiffuse ? 1.0f : 0.0f);
     const float3 specularAlbedo = lerp(0.03f, baseColor, metallic) * (enableSpecular ? 1.0f : 0.0f);
     float roughness = sqrtRoughness * sqrtRoughness;
-    if (AppSettings.ClampRoughness)
+    if(AppSettings.ClampRoughness)
         roughness = max(roughness, inPayload.Roughness);
-
+    
     float3 msEnergyCompensation = 1.0.xxx;
-    if (AppSettings.ApplyMultiscatteringEnergyCompensation)
+    if(AppSettings.ApplyMultiscatteringEnergyCompensation)
     {
         float2 DFG = GGXEnvironmentBRDFScaleBias(saturate(dot(normalWS, -incomingRayDirWS)), sqrtRoughness);
 
@@ -235,16 +243,16 @@ float3 PathTrace(in MeshVertex hitSurface, in Material material, in PrimaryPaylo
         float Ess = DFG.x;
         msEnergyCompensation = 1.0.xxx + specularAlbedo * (1.0f / Ess - 1.0f);
     }
-
+    
     Texture2D emissiveMap = ResourceDescriptorHeap[NonUniformResourceIndex(material.Emissive)];
     float3 radiance = AppSettings.EnableWhiteFurnaceMode ? 0.0.xxx : emissiveMap.SampleLevel(MeshSampler, hitSurface.UV, 0.0f).xyz;
-
+ 
     //Apply sun light
-    if (AppSettings.EnableSun && !AppSettings.EnableWhiteFurnaceMode)
+    if(AppSettings.EnableSun && !AppSettings.EnableWhiteFurnaceMode)
     {
         float3 sunDirection = RayTraceCB.SunDirectionWS;
 
-        if (AppSettings.SunAreaLightApproximation)
+        if(AppSettings.SunAreaLightApproximation)
         {
             float3 D = RayTraceCB.SunDirectionWS;
             float3 R = reflect(incomingRayDirWS, normalWS);
@@ -268,13 +276,13 @@ float3 PathTrace(in MeshVertex hitSurface, in Material material, in PrimaryPaylo
         uint traceRayFlags = RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH;
 
         // Stop using the any-hit shader once we've hit the max path length, since it's *really* expensive
-        if (inPayload.PathLength > AppSettings.MaxAnyHitPathLength)
+        if(inPayload.PathLength > AppSettings.MaxAnyHitPathLength)
             traceRayFlags = RAY_FLAG_FORCE_OPAQUE;
 
         const uint hitGroupOffset = RayTypeShadow;
         const uint hitGroupGeoMultiplier = NumRayTypes;
         const uint missShaderIdx = RayTypeShadow;
-        MyTraceShadowRay(traceRayFlags, 0xFFFFFFFF, hitGroupOffset, hitGroupGeoMultiplier, missShaderIdx, ray, payload);
+        TraceRay(Scene, traceRayFlags, 0xFFFFFFFF, hitGroupOffset, hitGroupGeoMultiplier, missShaderIdx, ray, payload);
 
         radiance += CalcLighting(normalWS, sunDirection, RayTraceCB.SunIrradiance, diffuseAlbedo, specularAlbedo,
                                  roughness, positionWS, incomingRayOriginWS, msEnergyCompensation) * payload.Visibility;
@@ -321,7 +329,7 @@ float3 PathTrace(in MeshVertex hitSurface, in Material material, in PrimaryPaylo
                 const uint hitGroupOffset = RayTypeShadow;
                 const uint hitGroupGeoMultiplier = NumRayTypes;
                 const uint missShaderIdx = RayTypeShadow;
-                MyTraceShadowRay(traceRayFlags, 0xFFFFFFFF, hitGroupOffset, hitGroupGeoMultiplier, missShaderIdx, ray, payload);
+                TraceRay(Scene, traceRayFlags, 0xFFFFFFFF, hitGroupOffset, hitGroupGeoMultiplier, missShaderIdx, ray, payload);
 
                 float3 intensity = spotLight.Intensity * angularAttenuation;
 
@@ -330,7 +338,7 @@ float3 PathTrace(in MeshVertex hitSurface, in Material material, in PrimaryPaylo
             }
         }
     }
-    
+
     // Choose our next path by importance sampling our BRDFs
     float2 brdfSample = SamplePoint(inPayload.PixelIdx, inPayload.SampleSetIdx);
 
@@ -338,15 +346,15 @@ float3 PathTrace(in MeshVertex hitSurface, in Material material, in PrimaryPaylo
     float3 rayDirTS = 0.0f;
 
     float selector = brdfSample.x;
-    if (enableSpecular == false)
+    if(enableSpecular == false)
         selector = 0.0f;
-    else if (enableDiffuse == false)
+    else if(enableDiffuse == false)
         selector = 1.0f;
 
-    if (selector < 0.5f)
+    if(selector < 0.5f)
     {
         // We're sampling the diffuse BRDF, so sample a cosine-weighted hemisphere
-        if (enableSpecular)
+        if(enableSpecular)
             brdfSample.x *= 2.0f;
         rayDirTS = SampleDirectionCosineHemisphere(brdfSample.x, brdfSample.y);
 
@@ -359,7 +367,7 @@ float3 PathTrace(in MeshVertex hitSurface, in Material material, in PrimaryPaylo
         // We're sampling the GGX specular BRDF by sampling the distribution of visible normals. See this post
         // for more info: https://schuttejoe.github.io/post/ggximportancesamplingpart2/.
         // Also see: https://hal.inria.fr/hal-00996995v1/document and https://hal.archives-ouvertes.fr/hal-01509746/document
-        if (enableDiffuse)
+        if(enableDiffuse)
             brdfSample.x = (brdfSample.x - 0.5f) * 2.0f;
 
         float3 incomingRayDirTS = normalize(mul(incomingRayDirWS, transpose(tangentToWorld)));
@@ -375,7 +383,7 @@ float3 PathTrace(in MeshVertex hitSurface, in Material material, in PrimaryPaylo
         throughput = (F * (G2 / G1));
         rayDirTS = sampleDirTS;
 
-        if (AppSettings.ApplyMultiscatteringEnergyCompensation)
+        if(AppSettings.ApplyMultiscatteringEnergyCompensation)
         {
             float2 DFG = GGXEnvironmentBRDFScaleBias(saturate(dot(normalTS, -incomingRayDirWS)), sqrtRoughness);
 
@@ -388,10 +396,10 @@ float3 PathTrace(in MeshVertex hitSurface, in Material material, in PrimaryPaylo
             throughput *= 1.0.xxx + specularAlbedo * (1.0f / Ess - 1.0f);
         }
     }
-
+    
     const float3 rayDirWS = normalize(mul(rayDirTS, tangentToWorld));
 
-    if (enableDiffuse && enableSpecular)
+    if(enableDiffuse && enableSpecular)
         throughput *= 2.0f;
 
     // Shoot another ray to get the next path
@@ -401,10 +409,10 @@ float3 PathTrace(in MeshVertex hitSurface, in Material material, in PrimaryPaylo
     ray.TMin = 0.00001f;
     ray.TMax = FP32Max;
 
-    if (inPayload.PathLength == 1 && !AppSettings.EnableDirect)
+    if(inPayload.PathLength == 1 && !AppSettings.EnableDirect)
         radiance = 0.0.xxx;
-    
-    if (AppSettings.EnableIndirect && (inPayload.PathLength + 1 < AppSettings.MaxPathLength) && !AppSettings.EnableWhiteFurnaceMode)
+
+    if(AppSettings.EnableIndirect && (inPayload.PathLength + 1 < AppSettings.MaxPathLength) && !AppSettings.EnableWhiteFurnaceMode)
     {
         PrimaryPayload payload;
         payload.Radiance = 0.0f;
@@ -417,13 +425,13 @@ float3 PathTrace(in MeshVertex hitSurface, in Material material, in PrimaryPaylo
         uint traceRayFlags = 0;
 
         // Stop using the any-hit shader once we've hit the max path length, since it's *really* expensive
-        if (payload.PathLength > AppSettings.MaxAnyHitPathLength)
+        if(payload.PathLength > AppSettings.MaxAnyHitPathLength)
             traceRayFlags = RAY_FLAG_FORCE_OPAQUE;
 
         const uint hitGroupOffset = RayTypeRadiance;
         const uint hitGroupGeoMultiplier = NumRayTypes;
         const uint missShaderIdx = RayTypeRadiance;
-        MyTracePrimaryRay<Depth+1>(traceRayFlags, 0xFFFFFFFF, hitGroupOffset, hitGroupGeoMultiplier, missShaderIdx, ray, payload);
+        TraceRay(Scene, traceRayFlags, 0xFFFFFFFF, hitGroupOffset, hitGroupGeoMultiplier, missShaderIdx, ray, payload);
 
         radiance += payload.Radiance * throughput;
     }
@@ -435,15 +443,15 @@ float3 PathTrace(in MeshVertex hitSurface, in Material material, in PrimaryPaylo
         uint traceRayFlags = RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH;
 
         // Stop using the any-hit shader once we've hit the max path length, since it's *really* expensive
-        if (inPayload.PathLength + 1 > AppSettings.MaxAnyHitPathLength)
+        if(inPayload.PathLength + 1 > AppSettings.MaxAnyHitPathLength)
             traceRayFlags = RAY_FLAG_FORCE_OPAQUE;
 
         const uint hitGroupOffset = RayTypeShadow;
         const uint hitGroupGeoMultiplier = NumRayTypes;
         const uint missShaderIdx = RayTypeShadow;
-        MyTraceShadowRay(traceRayFlags, 0xFFFFFFFF, hitGroupOffset, hitGroupGeoMultiplier, missShaderIdx, ray, payload);
+        TraceRay(Scene, traceRayFlags, 0xFFFFFFFF, hitGroupOffset, hitGroupGeoMultiplier, missShaderIdx, ray, payload);
 
-        if (AppSettings.EnableWhiteFurnaceMode)
+        if(AppSettings.EnableWhiteFurnaceMode)
         {
             radiance = throughput;
         }
@@ -455,194 +463,174 @@ float3 PathTrace(in MeshVertex hitSurface, in Material material, in PrimaryPaylo
             radiance += payload.Visibility * skyRadiance * throughput;
         }
     }
-    
+
     return radiance;
 }
 
-template<>
-float3 PathTrace<RECURSION_LIMIT>(in MeshVertex hitSurface, in Material material, in PrimaryPayload inPayload, float3 world_ro, float3 world_rd){
-    return float3(0, 0, 0);
+// MeshVertex is packed as 5 x float4:
+// 0: Position.xyz
+// 1: Normal.xyz
+// 2: UV.xy
+// 3: Tangent.xyz
+// 4: Bitangent.xyz
+static const uint MeshVertexFloatCount = 14;
+
+#ifdef USE_SER
+MeshVertex LoadMeshVertexF(Buffer<float> vtxBuffer, uint vertexIdx)
+{
+    uint base = vertexIdx * MeshVertexFloatCount;
+
+    MeshVertex v;
+    float3 p = float3(vtxBuffer[base + 0], vtxBuffer[base + 1], vtxBuffer[base + 2]);
+    float3 n = float3(vtxBuffer[base + 3], vtxBuffer[base + 4], vtxBuffer[base + 5]);
+    float2 u = float2(vtxBuffer[base + 6], vtxBuffer[base + 7]);
+    float3 t = float3(vtxBuffer[base + 8 ], vtxBuffer[base + 9], vtxBuffer[base + 10]);
+    float3 b = float3(vtxBuffer[base + 11], vtxBuffer[base + 12], vtxBuffer[base + 13]);
+
+    v.Position = p.xyz;
+    v.Normal   = n.xyz;
+    v.UV       = u.xy;
+    v.Tangent  = t.xyz;
+    v.Bitangent= b.xyz;
+    return v;
 }
 
-template<uint Depth>
-void MyTracePrimaryRay(uint traceRayFlags, uint instanceInclFlags,
-    uint hitGroupOffset,
-    uint hitGroupGeoMultiplier,
-    uint missShaderIdx,
-    RayDesc ray, inout PrimaryPayload payload)
+MeshVertex GetHitSurface(in HitAttributes attr, in uint geometryIdx)
 {
-    RayQuery<RAY_FLAG_NONE> q;
-    q.TraceRayInline(Scene, traceRayFlags, instanceInclFlags, ray);
-    while (q.Proceed())
-    {
-        switch (q.CandidateType())
-        {
-            case CANDIDATE_NON_OPAQUE_TRIANGLE:
-                HitAttributes attr;
-                attr.barycentrics = q.CandidateTriangleBarycentrics();
-                const MeshVertex hitSurface = GetHitSurface(attr, q.CandidateGeometryIndex(), q.CandidatePrimitiveIndex());
-                const Material material = GetGeometryMaterial(q.CandidateGeometryIndex());
+    float3 barycentrics = float3(
+        1.0 - attr.barycentrics.x - attr.barycentrics.y,
+        attr.barycentrics.x,
+        attr.barycentrics.y
+    );
 
-                // Standard alpha testing
-                Texture2D opacityMap = ResourceDescriptorHeap[NonUniformResourceIndex(material.Opacity)];
-                if (opacityMap.SampleLevel(MeshSampler, hitSurface.UV, 0.0f).x < 0.35f)
-                {
-                    // Ignore Hit
-                }
-                else
-                {
-                    q.CommitNonOpaqueTriangleHit();  // TODO
-                }
-                break;
-        }
-    }
-    
-    // Closest-hit Shader
-    switch (q.CommittedStatus())
+    StructuredBuffer<GeometryInfo> geoInfoBuffer = ResourceDescriptorHeap[RayTraceCB.GeometryInfoBufferIdx];
+    GeometryInfo geoInfo = geoInfoBuffer[geometryIdx];
+
+    Buffer<float> vtxBuffer = ResourceDescriptorHeap[RayTraceCB.VtxFloatBufferIdx];
+    Buffer<uint> idxBuffer  = ResourceDescriptorHeap[RayTraceCB.IdxBufferIdx];
+
+    uint primIdx = PrimitiveIndex();
+    uint idx0 = idxBuffer[primIdx * 3 + geoInfo.IdxOffset + 0] + geoInfo.VtxOffset;
+    uint idx1 = idxBuffer[primIdx * 3 + geoInfo.IdxOffset + 1] + geoInfo.VtxOffset;
+    uint idx2 = idxBuffer[primIdx * 3 + geoInfo.IdxOffset + 2] + geoInfo.VtxOffset;
+
+    MeshVertex v0 = LoadMeshVertexF(vtxBuffer, idx0);
+    MeshVertex v1 = LoadMeshVertexF(vtxBuffer, idx1);
+    MeshVertex v2 = LoadMeshVertexF(vtxBuffer, idx2);
+
+    return BarycentricLerp(v0, v1, v2, barycentrics);
+}
+#else
+MeshVertex GetHitSurface(in HitAttributes attr, in uint geometryIdx)
+{
+    float3 barycentrics = float3(1 - attr.barycentrics.x - attr.barycentrics.y, attr.barycentrics.x, attr.barycentrics.y);
+
+    StructuredBuffer<GeometryInfo> geoInfoBuffer = ResourceDescriptorHeap[RayTraceCB.GeometryInfoBufferIdx];
+    const GeometryInfo geoInfo = geoInfoBuffer[geometryIdx];
+
+    StructuredBuffer<MeshVertex> vtxBuffer = ResourceDescriptorHeap[RayTraceCB.VtxBufferIdx];
+    Buffer<uint> idxBuffer = ResourceDescriptorHeap[RayTraceCB.IdxBufferIdx];
+
+    const uint primIdx = PrimitiveIndex();
+    const uint idx0 = idxBuffer[primIdx * 3 + geoInfo.IdxOffset + 0];
+    const uint idx1 = idxBuffer[primIdx * 3 + geoInfo.IdxOffset + 1];
+    const uint idx2 = idxBuffer[primIdx * 3 + geoInfo.IdxOffset + 2];
+
+    const MeshVertex vtx0 = vtxBuffer[idx0 + geoInfo.VtxOffset];
+    const MeshVertex vtx1 = vtxBuffer[idx1 + geoInfo.VtxOffset];
+    const MeshVertex vtx2 = vtxBuffer[idx2 + geoInfo.VtxOffset];
+
+    return BarycentricLerp(vtx0, vtx1, vtx2, barycentrics);
+}
+#endif
+
+// Gets the material assigned to a geometry in the acceleration structure
+Material GetGeometryMaterial(in uint geometryIdx)
+{
+    StructuredBuffer<GeometryInfo> geoInfoBuffer = ResourceDescriptorHeap[RayTraceCB.GeometryInfoBufferIdx];
+    const GeometryInfo geoInfo = geoInfoBuffer[geometryIdx];
+
+    StructuredBuffer<Material> materialBuffer = ResourceDescriptorHeap[RayTraceCB.MaterialBufferIdx];
+    return materialBuffer[geoInfo.MaterialIdx];
+}
+
+float3 IDtoColor(uint id)
+{
+    const float GOLDEN_RATIO = 0.61803398875f;
+
+    float hue = frac(id * GOLDEN_RATIO);
+    float saturation = 0.75f;
+    float value = 0.95f;
+    float3 hsv = float3(hue, saturation, value);
+
+    float4 K = float4(1.f, 2.f/3.f, 1.f/3.f, 3.f);
+    float3 p =abs(frac(hsv.xxx + K.xyz) * 6.f - K.www);
+    return hsv.z * lerp(K.xxx, saturate(p - K.xxx), hsv.y);
+}
+
+[shader("closesthit")]
+void ClosestHitShader(inout PrimaryPayload payload, in HitAttributes attr)
+{
+    const MeshVertex hitSurface = GetHitSurface(attr, GeometryIndex());
+    const Material material = GetGeometryMaterial(GeometryIndex());
+    payload.Radiance = PathTrace(hitSurface, material, payload);
+}
+
+[shader("anyhit")]
+void AnyHitShader(inout PrimaryPayload payload, in HitAttributes attr)
+{
+    const MeshVertex hitSurface = GetHitSurface(attr, GeometryIndex());
+    const Material material = GetGeometryMaterial(GeometryIndex());
+
+    // Standard alpha testing
+    Texture2D opacityMap = ResourceDescriptorHeap[NonUniformResourceIndex(material.Opacity)];
+    if(opacityMap.SampleLevel(MeshSampler, hitSurface.UV, 0.0f).x < 0.35f)
+        IgnoreHit();
+}
+
+[shader("anyhit")]
+void ShadowAnyHitShader(inout ShadowPayload payload, in HitAttributes attr)
+{
+    const MeshVertex hitSurface = GetHitSurface(attr, GeometryIndex());
+    const Material material = GetGeometryMaterial(GeometryIndex());
+
+    // Standard alpha testing
+    Texture2D opacityMap = ResourceDescriptorHeap[NonUniformResourceIndex(material.Opacity)];
+    if(opacityMap.SampleLevel(MeshSampler, hitSurface.UV, 0.0f).x < 0.35f)
+        IgnoreHit();
+}
+
+[shader("miss")]
+void MissShader(inout PrimaryPayload payload)
+{
+    if(AppSettings.EnableWhiteFurnaceMode)
     {
-        case COMMITTED_TRIANGLE_HIT:
+        payload.Radiance = 1.0.xxx;
+    }
+    else
+    {
+        const float3 rayDir = WorldRayDirection();
+
+        TextureCube skyTexture = ResourceDescriptorHeap[RayTraceCB.SkyTextureIdx];
+        payload.Radiance = AppSettings.EnableSky ? skyTexture.SampleLevel(LinearSampler, rayDir, 0.0f).xyz : 0.0.xxx;
+
+        if(payload.PathLength == 1)
         {
-            HitAttributes attr;
-            attr.barycentrics = q.CommittedTriangleBarycentrics();
-            const MeshVertex hitSurface = GetHitSurface(attr, q.CommittedGeometryIndex(), q.CommittedPrimitiveIndex());
-            const Material material = GetGeometryMaterial(q.CommittedGeometryIndex());
-            payload.Radiance = PathTrace<Depth>(hitSurface, material, payload, q.WorldRayOrigin(), q.WorldRayDirection());
-            break;
-        }
-        case COMMITTED_PROCEDURAL_PRIMITIVE_HIT:
-        {
-            break;
-        }
-        case COMMITTED_NOTHING:{
-            MissShader(q.WorldRayDirection(), payload);
-            break;
+            float cosSunAngle = dot(rayDir, RayTraceCB.SunDirectionWS);
+            if(cosSunAngle >= RayTraceCB.CosSunAngularRadius)
+                payload.Radiance = RayTraceCB.SunRenderColor;
         }
     }
 }
 
-template<>
-void MyTracePrimaryRay<RECURSION_LIMIT>(uint traceRayFlags, uint instanceInclFlags,
-    uint hitGroupOffset,
-    uint hitGroupGeoMultiplier,
-    uint missShaderIdx,
-    RayDesc ray, inout PrimaryPayload payload)
+[shader("closesthit")]
+void ShadowHitShader(inout ShadowPayload payload, in HitAttributes attr)
 {
-    
+    payload.Visibility = 0.0f;
 }
 
-void MyTraceShadowRay(uint traceRayFlags, uint instanceInclFlags,
-    uint hitGroupOffset,
-    uint hitGroupGeoMultiplier,
-    uint missShaderIdx,
-    RayDesc ray, inout ShadowPayload payload)
+[shader("miss")]
+void ShadowMissShader(inout ShadowPayload payload)
 {
-    RayQuery < RAY_FLAG_NONE > q;
-    q.TraceRayInline(Scene, traceRayFlags, instanceInclFlags, ray);
-    while (q.Proceed())
-    {
-        switch (q.CandidateType())
-        {
-            case CANDIDATE_NON_OPAQUE_TRIANGLE:
-                HitAttributes attr;
-                attr.barycentrics = q.CandidateTriangleBarycentrics();
-                const MeshVertex hitSurface = GetHitSurface(attr, q.CandidateGeometryIndex(), q.CandidatePrimitiveIndex());
-                const Material material = GetGeometryMaterial(q.CandidateGeometryIndex());
-
-                // Standard alpha testing
-                Texture2D opacityMap = ResourceDescriptorHeap[NonUniformResourceIndex(material.Opacity)];
-                if (opacityMap.SampleLevel(MeshSampler, hitSurface.UV, 0.0f).x < 0.35f)
-                {
-                    // Ignore Hit
-                }
-                else
-                {
-                    q.CommitNonOpaqueTriangleHit(); // TODO
-                }
-                break;
-        }
-    }
-    
-    // Closest-hit Shader
-    switch (q.CommittedStatus())
-    {
-        case COMMITTED_TRIANGLE_HIT:
-        {
-            payload.Visibility = 0.0f;
-            break;
-        }
-        case COMMITTED_PROCEDURAL_PRIMITIVE_HIT:
-        {
-            break;
-        }
-        case COMMITTED_NOTHING:{
-            payload.Visibility = 1.0f;
-            break;
-        }
-    }
-}
-
-[numthreads(8, 8, 1)]
-void main(uint3 dispatchThreadID : SV_DispatchThreadID)
-{
-    int width;
-    int height;
-    RenderTarget.GetDimensions(width, height);
-//    uint2 dixy = dispatchThreadID.xy;
-//    RenderTarget[dixy] = float4(dixy / float2(width, height), 0, 1);
-    
-    const uint2 pixelCoord = dispatchThreadID.xy;
-    const uint pixelIdx = pixelCoord.y * width + pixelCoord.x;
-    
-    uint sampleSetIdx = 0;
-    
-    // Form a primary ray by un-projecting the pixel coordinate using the inverse view * projection matrix
-    float2 primaryRaySample = SamplePoint(pixelIdx, sampleSetIdx);
-    
-    float2 rayPixelPos = pixelCoord + primaryRaySample;
-    float2 ncdXY = (rayPixelPos / (float2(width, height) * 0.5f)) - 1.0f;
-    ncdXY.y *= -1.0f;
-    float4 rayStart = mul(float4(ncdXY, 0.0f, 1.0f), RayTraceCB.InvViewProjection);
-    float4 rayEnd = mul(float4(ncdXY, 1.0f, 1.0f), RayTraceCB.InvViewProjection);
-    
-    rayStart.xyz /= rayStart.w;
-    rayEnd.xyz /= rayEnd.w;
-    float3 rayDir = normalize(rayEnd.xyz - rayStart.xyz);
-    float rayLength = length(rayEnd.xyz - rayStart.xyz);
-    
-    // Trace a primary ray
-    RayDesc ray;
-    ray.Origin = rayStart.xyz;
-    ray.Direction = rayDir;
-    ray.TMin = 0.0f;
-    ray.TMax = rayLength;
-    
-    PrimaryPayload payload;
-    payload.Radiance = 0.0f;
-    payload.Roughness = 0.0f;
-    payload.PathLength = 1;
-    payload.PixelIdx = pixelIdx;
-    payload.SampleSetIdx = sampleSetIdx;
-    payload.IsDiffuse = false;
-
-    uint traceRayFlags = 0;
-
-    // Stop using the any-hit shader once we've hit the max path length, since it's *really* expensive
-    if (payload.PathLength > AppSettings.MaxAnyHitPathLength)
-        traceRayFlags = RAY_FLAG_FORCE_OPAQUE;
-
-    const uint hitGroupOffset = RayTypeRadiance;
-    const uint hitGroupGeoMultiplier = NumRayTypes;
-    const uint missShaderIdx = RayTypeRadiance;
-    
-    MyTracePrimaryRay<0>(traceRayFlags, 0xFFFFFFFF, hitGroupOffset, hitGroupGeoMultiplier, missShaderIdx, ray, payload);
-    
-    payload.Radiance = clamp(payload.Radiance, 0.0f, FP16Max);
-
-    // Update the progressive result with the new radiance sample
-    const float lerpFactor = RayTraceCB.CurrSampleIdx / (RayTraceCB.CurrSampleIdx + 1.0f);
-    float3 newSample = payload.Radiance;
-    float3 currValue = RenderTarget[pixelCoord].xyz;
-    float3 newValue = lerp(newSample, currValue, lerpFactor);
-
-    RenderTarget[pixelCoord] = float4(newValue, 1.0f);
+    payload.Visibility = 1.0f;
 }

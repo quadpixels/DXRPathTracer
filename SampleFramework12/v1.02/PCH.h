@@ -66,7 +66,7 @@ typedef uint32_t bool32;
 #define assert(expression) ((void)0)
 
 // DirectX Includes
-#include "..\\..\\Externals\\DXSDK\\Include\\d3d12.h"
+#include "d3d12.h"
 #include <dxgi.h>
 #include <dxgi1_6.h>
 #include <D3Dcompiler.h>
@@ -168,10 +168,8 @@ typedef uint32_t bool32;
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "psapi.lib")
 #pragma comment(lib, "gdiplus.lib")
-#pragma comment(lib, "D3D12.lib")
 
-#include "..\\..\\Externals\\DXCompiler\\Include\\dxcapi.h"
-#pragma comment(lib, "..\\Externals\\DXCompiler\\Lib\\dxcompiler.lib")
+#include <dxcapi.h>
 
 #ifdef _DEBUG
     #pragma comment(lib, "comsuppwd.lib")

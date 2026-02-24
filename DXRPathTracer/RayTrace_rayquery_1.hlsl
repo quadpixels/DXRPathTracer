@@ -34,6 +34,7 @@ struct RayTraceConstants
     uint TotalNumPixels;
 
     uint VtxBufferIdx;
+    uint VtxFloatBufferIdx;
     uint IdxBufferIdx;
     uint GeometryInfoBufferIdx;
     uint MaterialBufferIdx;

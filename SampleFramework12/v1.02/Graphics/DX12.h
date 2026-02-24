@@ -25,7 +25,7 @@ extern ID3D12Device5* Device;
 extern ID3D12GraphicsCommandList4* CmdList;
 extern ID3D12CommandQueue* GfxQueue;
 extern D3D_FEATURE_LEVEL FeatureLevel;
-extern IDXGIFactory4* Factory;
+extern IDXGIFactory5* Factory;
 extern IDXGIAdapter1* Adapter;
 
 extern uint64 CurrentCPUFrame;  // Total number of CPU frames completed (completed means all command buffers submitted to the GPU)

@@ -289,6 +289,7 @@ public:
     const Array<PointLight>& PointLights() const { return pointLights; }
 
     const StructuredBuffer& VertexBuffer() const { return vertexBuffer; }
+    const FormattedBuffer& VertexFloatBuffer() const { return vertexFloatBuffer; }
     const FormattedBuffer& IndexBuffer() const { return indexBuffer; }
 
     const MeshVertex* Vertices() const { return vertices.Data(); }
@@ -337,6 +338,7 @@ protected:
     Float3 aabbMax;
 
     StructuredBuffer vertexBuffer;
+    FormattedBuffer vertexFloatBuffer;
     FormattedBuffer indexBuffer;
     Array<MeshVertex> vertices;
     Array<uint8> indices;

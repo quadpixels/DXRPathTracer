@@ -309,22 +309,10 @@
   </ItemGroup>
   <ItemGroup>
     <CustomBuild Include="AppSettings.cs" />
-    <CustomBuild Include="..\Externals\WinPixEventRuntime\bin\WinPixEventRuntime.dll">
-      <Filter>SampleFramework12\External DLLs</Filter>
-    </CustomBuild>
-    <CustomBuild Include="..\Externals\DXCompiler\Bin\dxcompiler.dll">
-      <Filter>SampleFramework12\External DLLs</Filter>
-    </CustomBuild>
     <CustomBuild Include="..\Externals\Assimp-4.1.0\bin\assimp-vc140-mt.dll">
       <Filter>SampleFramework12\External DLLs</Filter>
     </CustomBuild>
-    <CustomBuild Include="..\Externals\DXCompiler\Bin\dxil.dll">
-      <Filter>SampleFramework12\External DLLs</Filter>
-    </CustomBuild>
-    <CustomBuild Include="..\Externals\DXSDK\Bin\D3D12Core.dll">
-      <Filter>SampleFramework12\External DLLs</Filter>
-    </CustomBuild>
-    <CustomBuild Include="..\Externals\DXSDK\Bin\d3d12SDKLayers.dll">
+    <CustomBuild Include="..\Externals\WinPixEventRuntime\bin\WinPixEventRuntime.dll">
       <Filter>SampleFramework12\External DLLs</Filter>
     </CustomBuild>
   </ItemGroup>
@@ -332,5 +320,8 @@
     <Natvis Include="..\SampleFramework12\v1.02\sf12.natvis">
       <Filter>SampleFramework12</Filter>
     </Natvis>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="packages.config" />
   </ItemGroup>
 </Project>

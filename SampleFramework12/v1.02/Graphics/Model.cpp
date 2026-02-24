@@ -680,6 +680,7 @@ void Model::Shutdown()
     forceSRGB = false;
 
     vertexBuffer.Shutdown();
+    vertexFloatBuffer.Shutdown();
     indexBuffer.Shutdown();
     vertices.Shutdown();
     indices.Shutdown();
@@ -710,9 +711,16 @@ void Model::CreateBuffers()
     sbInit.InitData = vertices.Data();
     vertexBuffer.Initialize(sbInit);
 
+    const uint32 vertSize = static_cast<uint32>(vertices.Size() * sizeof(MeshVertex) / 4);
+    FormattedBufferInit fbInit;
+    fbInit.Format = DXGI_FORMAT_R32_FLOAT;
+    fbInit.NumElements = vertSize;
+    fbInit.InitData = vertices.Data();
+    vertexFloatBuffer.Initialize(fbInit);
+
     const uint32 indexSize = IndexSize();
 
-    FormattedBufferInit fbInit;
+    fbInit = {};
     fbInit.Format = IndexBufferFormat();
     fbInit.NumElements = indices.Size() / indexSize;
     fbInit.InitData = indices.Data();

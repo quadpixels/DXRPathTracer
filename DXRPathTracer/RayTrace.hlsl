@@ -41,6 +41,8 @@ struct RayTraceConstants
     uint MaterialBufferIdx;
     uint SkyTextureIdx;
     uint NumLights;
+    
+    uint myFlags;
 };
 
 struct LightConstants

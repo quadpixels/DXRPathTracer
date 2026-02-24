@@ -16,6 +16,8 @@
 #include "ImGui/imgui.h"
 
 extern int g_render_path;
+extern bool g_has_ser;
+extern bool g_use_ser;
 
 namespace SampleFramework12
 {
@@ -857,6 +859,10 @@ void SettingsContainer::Update(uint32 displayWidth, uint32 displayHeight, const 
 
     ImGui::Text("Render Path");
     ImGui::RadioButton("DXR1.0", &g_render_path, 0);
+    if (g_has_ser) {
+      ImGui::SameLine();
+      ImGui::Checkbox("Use SER", &g_use_ser);
+    }
     ImGui::RadioButton("DXR1.1 (template recursion)", &g_render_path, 1);
     ImGui::RadioButton("DXR1.1 (loop-based)", &g_render_path, 2);
 

@@ -30,6 +30,9 @@
 #include "DXRPathTracer.h"
 #include "SharedTypes.h"
 
+extern bool g_has_ser;
+extern bool g_use_ser;
+
 using namespace SampleFramework12;
 
 // Model filenames
@@ -107,11 +110,14 @@ struct RayTraceConstants
     uint32 TotalNumPixels = 0;
 
     uint32 VtxBufferIdx = uint32(-1);
+    uint32 VtxFloatBufferIdx = uint32(-1);
     uint32 IdxBufferIdx = uint32(-1);
     uint32 GeometryInfoBufferIdx = uint32(-1);
     uint32 MaterialBufferIdx = uint32(-1);
     uint32 SkyTextureIdx = uint32(-1);
     uint32 NumLights = 0;
+
+    uint32 myFlags = 0;
 };
 
 enum ClusterRootParams : uint32
@@ -209,6 +215,26 @@ void DXRPathTracer::Initialize()
         AppSettings::ClusterRasterizationMode.SetValue(ClusterRasterizationModes::MSAA8x);
         AppSettings::ClusterRasterizationMode.ClampNumValues(uint32(ClusterRasterizationModes::NumValues) - 1);
     }
+
+    D3D12_FEATURE_DATA_SHADER_MODEL SM;
+    SM.HighestShaderModel = D3D_SHADER_MODEL_6_9;
+    DX12::Device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &SM, sizeof(SM));
+    printf("shader model is: ");
+    switch (SM.HighestShaderModel) {
+      case D3D_SHADER_MODEL_6_9:
+        printf("6.9"); break;
+      case D3D_SHADER_MODEL_6_8:
+        printf("6.8"); break;
+      case D3D_SHADER_MODEL_6_7:
+        printf("6.7"); break;
+      case D3D_SHADER_MODEL_6_6:
+        printf("6.6"); break;
+      case D3D_SHADER_MODEL_6_5:
+        printf("6.5"); break;
+      default:
+        printf("not sure"); break;
+    }
+    printf("\n");
 
     float aspect = float(swapChain.Width()) / swapChain.Height();
     camera.Initialize(aspect, Pi_4, 0.1f, 100.0f);
@@ -654,7 +680,17 @@ void DXRPathTracer::InitializeScene()
 
 void DXRPathTracer::InitRayTracing()
 {
-    rayTraceLib = CompileFromFile(L"RayTrace.hlsl", nullptr, ShaderType::Library);
+    CompileOptions co;
+    if (g_has_ser) {
+      co.Add("USE_SER", 1);
+    }
+
+    {
+      if (g_has_ser)
+        rayTraceLib = CompileFromFile(L"RayTrace_ser.hlsl", nullptr, ShaderType::Library, co);
+      else
+        rayTraceLib = CompileFromFile(L"RayTrace_ser.hlsl", nullptr, ShaderType::Library, co);
+    }
 
     {
         // RayTrace root signature
@@ -723,8 +759,8 @@ void DXRPathTracer::InitRayTracing()
     rtCurrCamera = camera;
 
     // RayQuery ver
-    rayTraceRayQueryCS = CompileFromFile(L"RayTrace_rayquery.hlsl", nullptr, ShaderType::Compute);
-    rayTraceRayQuery1CS = CompileFromFile(L"RayTrace_rayquery_1.hlsl", nullptr, ShaderType::Compute);
+    rayTraceRayQueryCS = CompileFromFile(L"RayTrace_rayquery.hlsl", nullptr, ShaderType::Compute, co);
+    rayTraceRayQuery1CS = CompileFromFile(L"RayTrace_rayquery_1.hlsl", nullptr, ShaderType::Compute, co);
 }
 
 void DXRPathTracer::CreateRayTracingPSOs()
@@ -1360,11 +1396,17 @@ void DXRPathTracer::RenderRayTracing()
     rtConstants.TotalNumPixels = uint32(rtTarget.Width()) * uint32(rtTarget.Height());
 
     rtConstants.VtxBufferIdx = currentModel->VertexBuffer().SRV;
+    rtConstants.VtxFloatBufferIdx = currentModel->VertexFloatBuffer().SRV;
     rtConstants.IdxBufferIdx = currentModel->IndexBuffer().SRV;
     rtConstants.GeometryInfoBufferIdx = rtGeoInfoBuffer.SRV;
     rtConstants.MaterialBufferIdx = meshRenderer.MaterialBuffer().SRV;
     rtConstants.SkyTextureIdx = skyCache.CubeMap.SRV;
     rtConstants.NumLights = Min<uint32>(uint32(spotLights.Size()), AppSettings::MaxLightClamp);
+
+    rtConstants.myFlags = 0;
+    if (g_has_ser && g_use_ser) {
+      rtConstants.myFlags |= 1;
+    }
 
     DX12::BindTempConstantBuffer(cmdList, rtConstants, RTParams_CBuffer, CmdListMode::Compute);
 
@@ -1376,6 +1418,7 @@ void DXRPathTracer::RenderRayTracing()
 
     switch (g_render_path) {
     case 0: {
+      ProfileBlock pb(cmdList, "TraceRay DispatchRays");
       cmdList->SetPipelineState1(rtPSO);
       D3D12_DISPATCH_RAYS_DESC dispatchDesc = {};
       dispatchDesc.HitGroupTable = rtHitTable.ShaderTable();
@@ -1388,6 +1431,7 @@ void DXRPathTracer::RenderRayTracing()
       break;
     }
     case 1: {
+      ProfileBlock pb(cmdList, "RayQuery Dispatch (template)");
       cmdList->SetPipelineState(rtRayQueryPSO);
       uint32_t gx, gy;
       gx = static_cast<uint32_t>(rtTarget.Width() - 1) / 8 + 1;
@@ -1396,6 +1440,7 @@ void DXRPathTracer::RenderRayTracing()
       break;
     }
     case 2: {
+      ProfileBlock pb(cmdList, "RayQuery Dispatch (loop)");
       cmdList->SetPipelineState(rtRayQuery1PSO);
       uint32_t gx, gy;
       gx = static_cast<uint32_t>(rtTarget.Width() - 1) / 8 + 1;

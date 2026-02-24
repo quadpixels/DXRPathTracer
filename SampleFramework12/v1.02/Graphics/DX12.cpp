@@ -27,9 +27,12 @@
 StaticAssert_(D3D_SHADER_FEATURE_RESOURCE_DESCRIPTOR_HEAP_INDEXING);
 
 // Add our magic exports so that the D3D12 loader finds D3D12Core.dll
-extern "C" { _declspec(dllexport) extern const UINT D3D12SDKVersion = D3D12_SDK_VERSION;}
+//extern "C" { _declspec(dllexport) extern const UINT D3D12SDKVersion = D3D12_SDK_VERSION;}
+extern "C" { __declspec(dllexport) extern const UINT D3D12SDKVersion = 717; }
+extern "C" { _declspec(dllexport) extern const char* D3D12SDKPath = ".\\D3D12\\"; }
 
-extern "C" { _declspec(dllexport) extern const char8_t* D3D12SDKPath = u8".\\D3D12\\"; }
+bool g_has_ser = false;
+bool g_use_ser = false;  // Actually use SER ?
 
 namespace SampleFramework12
 {
@@ -41,7 +44,7 @@ ID3D12Device5* Device = nullptr;
 ID3D12GraphicsCommandList4* CmdList = nullptr;
 ID3D12CommandQueue* GfxQueue = nullptr;
 D3D_FEATURE_LEVEL FeatureLevel = D3D_FEATURE_LEVEL_11_0;
-IDXGIFactory4* Factory = nullptr;
+IDXGIFactory5* Factory = nullptr;
 IDXGIAdapter1* Adapter = nullptr;
 
 uint64 CurrentCPUFrame = 0;
@@ -94,6 +97,18 @@ static void ProcessDeferredSRVCreates(uint64 frameIdx)
 void Initialize(D3D_FEATURE_LEVEL minFeatureLevel, uint32 adapterIdx)
 {
     ShuttingDown = false;
+
+    {
+      UUID Features[] = { D3D12ExperimentalShaderModels };
+      HRESULT hr = D3D12EnableExperimentalFeatures(_countof(Features), Features, nullptr, nullptr);
+      if (SUCCEEDED(hr)) {
+        printf("Experimental shader models enabled.\n");
+        g_has_ser = true;
+      }
+      else {
+        printf("Oh! Experimental shader models not enabled. 0x%08x\n", hr);
+      }
+    }
 
     HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(&Factory));
     if(FAILED(hr))
@@ -150,6 +165,12 @@ void Initialize(D3D_FEATURE_LEVEL minFeatureLevel, uint32 adapterIdx)
     DXCall(Device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &shaderModel, sizeof(shaderModel)));
     if(shaderModel.HighestShaderModel < D3D_SHADER_MODEL_6_6)
         throw Exception(L"The device does not support the minimum shader model required to run this sample (SM 6.6)");
+
+    if (g_has_ser) {
+      D3D12_FEATURE_DATA_SHADER_MODEL sm = { D3D_SHADER_MODEL_6_9 };
+      hr = Device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &sm, sizeof(sm));
+      printf("CheckFeatureSupport SM6.9 hr=0x%08x, highest=%u\n", hr, sm.HighestShaderModel);
+    }
 
     // Check the requires resource binding tier
     D3D12_FEATURE_DATA_D3D12_OPTIONS features = { };

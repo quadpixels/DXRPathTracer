@@ -19,10 +19,19 @@
 #include "..\\MurmurHash.h"
 #include "..\\Containers.h"
 
+#include <wrl/client.h>
+#include <dxcapi.h>
+using Microsoft::WRL::ComPtr;
+
+
+#include <atlbase.h>
+
 using std::vector;
 using std::wstring;
 using std::string;
 using std::map;
+
+extern bool g_has_ser;
 
 namespace SampleFramework12
 {
@@ -48,6 +57,7 @@ static Hash MakeCompilerHash()
 
     wchar dllPath[1024] = { };
     GetModuleFileName(module, dllPath, ArraySize_(dllPath));
+    wprintf(L"DXC loaded from: %ls\n", dllPath);
 
     File dllFile(dllPath, FileOpenMode::Read);
     uint64 fileSize = dllFile.Size();
@@ -255,6 +265,9 @@ static void CompileShader(const wchar* path, const char* functionName, ShaderTyp
     uint64 profileIdx = uint64(type);
     Assert_(profileIdx < ArraySize_(ProfileStrings));
     const char* profileString = ProfileStrings[profileIdx];
+    if (type == ShaderType::Library && g_has_ser) {
+      profileString = "lib_6_9";
+    }
 
     // Make a hash off the expanded shader code
     string shaderCode = GetExpandedShaderCode(path, filePaths);
