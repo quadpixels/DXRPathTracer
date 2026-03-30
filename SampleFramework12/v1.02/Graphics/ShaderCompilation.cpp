@@ -265,7 +265,7 @@ static void CompileShader(const wchar* path, const char* functionName, ShaderTyp
     uint64 profileIdx = uint64(type);
     Assert_(profileIdx < ArraySize_(ProfileStrings));
     const char* profileString = ProfileStrings[profileIdx];
-    if (type == ShaderType::Library && g_has_ser) {
+    if (type == ShaderType::Library && g_has_ser && std::wstring(path).find(L"ser") != std::wstring::npos) {
       profileString = "lib_6_9";
     }
 

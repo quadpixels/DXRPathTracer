@@ -36,6 +36,7 @@ struct RayTraceConstants
     uint TotalNumPixels;
 
     uint VtxBufferIdx;
+    uint VtxFloatBufferIdx;
     uint IdxBufferIdx;
     uint GeometryInfoBufferIdx;
     uint MaterialBufferIdx;
@@ -123,10 +124,10 @@ void RaygenShader()
     PrimaryPayload payload;
     payload.Radiance = 0.0f;
     payload.Roughness = 0.0f;
-    payload.PathLength = 1;
-    payload.PixelIdx = pixelIdx;
+    payload.PathLength = 1;       // 6b
+    payload.PixelIdx = pixelIdx;  // 24b
     payload.SampleSetIdx = sampleSetIdx;
-    payload.IsDiffuse = false;
+    payload.IsDiffuse = false;    // 1b
 
     uint traceRayFlags = 0;
 
@@ -146,6 +147,10 @@ void RaygenShader()
     float3 newSample = payload.Radiance;
     float3 currValue = RenderTarget[pixelCoord].xyz;
     float3 newValue = lerp(newSample, currValue, lerpFactor);
+    
+    if (RayTraceCB.CurrSampleIdx == 0) {  // Prevent NAN from sticking
+        newValue = newSample;
+    }
 
     RenderTarget[pixelCoord] = float4(newValue, 1.0f);
 }
@@ -387,7 +392,9 @@ static float3 PathTrace(in MeshVertex hitSurface, in Material material, in Prima
     if(inPayload.PathLength == 1 && !AppSettings.EnableDirect)
         radiance = 0.0.xxx;
 
-    if(AppSettings.EnableIndirect && (inPayload.PathLength + 1 < AppSettings.MaxPathLength) && !AppSettings.EnableWhiteFurnaceMode)
+    if(AppSettings.EnableIndirect &&
+       (inPayload.PathLength + 1 < AppSettings.MaxPathLength) &&
+       !AppSettings.EnableWhiteFurnaceMode)
     {
         PrimaryPayload payload;
         payload.Radiance = 0.0f;

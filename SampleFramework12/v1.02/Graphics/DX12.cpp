@@ -124,7 +124,12 @@ void Initialize(D3D_FEATURE_LEVEL minFeatureLevel, uint32 adapterIdx)
 
     DXGI_ADAPTER_DESC1 desc = { };
     Adapter->GetDesc1(&desc);
-    WriteLog("Creating DX12 device on adapter '%ls'", desc.Description);
+    std::wstring deviceName(desc.Description);
+    if (deviceName.find(L"RTX 50") != std::wstring::npos) {
+      printf("Activating SER.\n");
+      g_use_ser = true;
+    }
+    WriteLog("Creating DX12 device on adapter '%ls'", deviceName.c_str());
 
     #if UseDebugDevice_
         ID3D12DebugPtr d3d12debug;

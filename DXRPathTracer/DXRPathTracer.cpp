@@ -57,7 +57,7 @@ StaticAssert_(ArraySize_(SceneCameraPositions) == uint64(Scenes::NumValues));
 StaticAssert_(ArraySize_(SceneCameraRotations) == uint64(Scenes::NumValues));
 StaticAssert_(ArraySize_(SceneSunDirections) == uint64(Scenes::NumValues));
 
-int g_render_path = 0;  // 0=DXR1.0; 1=DXR1.1 recursion, 2=DXR1.1 loop
+int g_render_path = 0;  // 0=DXR1.0 original, 1=DXR1.0 SER, 2=DXR1.0 loop SER, 3=DXR1.0 loop my 4=DXR1.1 recursion, 5=DXR1.1 loop
 
 static const uint64 NumConeSides = 16;
 
@@ -508,7 +508,15 @@ void DXRPathTracer::CreatePSOs()
         DXCall(DX12::Device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&resolvePSO)));
     }
 
-    CreateRayTracingPSOs();
+    // DXR 1.0 PSOs, 2 in total
+    CreateRayTracingPSOs(rayTraceLib, &rtPSO, &rtRayGenTable, &rtHitTable, &rtMissTable);
+    if (g_has_ser && g_use_ser) {
+        CreateRayTracingPSOs(rayTraceLib_SER, &rtPSO_SER, &rtRayGenTable_SER, &rtHitTable_SER, &rtMissTable_SER);
+        CreateRayTracingPSOs(rayTraceLibLoop_SER, &rtPSOLoop_SER, &rtRayGenTableLoop_SER, &rtHitTableLoop_SER, &rtMissTableLoop_SER);
+    }
+    CreateRayTracingPSOs(rayTraceLibLoop_my, &rtPSOLoop_my, &rtRayGenTableLoop_my, &rtHitTableLoop_my, &rtMissTableLoop_my);
+    // DXR 1.1 PSOs, 2 in total
+    CreateRayTracingRayQueryPSOs();
 }
 
 void DXRPathTracer::DestroyPSOs()
@@ -686,10 +694,12 @@ void DXRPathTracer::InitRayTracing()
     }
 
     {
-      if (g_has_ser)
-        rayTraceLib = CompileFromFile(L"RayTrace_ser.hlsl", nullptr, ShaderType::Library, co);
-      else
-        rayTraceLib = CompileFromFile(L"RayTrace_ser.hlsl", nullptr, ShaderType::Library, co);
+        rayTraceLib         = CompileFromFile(L"RayTrace.hlsl", nullptr, ShaderType::Library, co);
+        if (g_has_ser && g_use_ser) {
+            rayTraceLib_SER = CompileFromFile(L"RayTrace_ser.hlsl", nullptr, ShaderType::Library, co);
+            rayTraceLibLoop_SER = CompileFromFile(L"RayTrace_ser_loop.hlsl", nullptr, ShaderType::Library, co);
+        }
+        rayTraceLibLoop_my  = CompileFromFile(L"RayTrace_loop_my.hlsl", nullptr, ShaderType::Library, co);  // Refactor testing
     }
 
     {
@@ -763,7 +773,8 @@ void DXRPathTracer::InitRayTracing()
     rayTraceRayQuery1CS = CompileFromFile(L"RayTrace_rayquery_1.hlsl", nullptr, ShaderType::Compute, co);
 }
 
-void DXRPathTracer::CreateRayTracingPSOs()
+void DXRPathTracer::CreateRayTracingPSOs(const CompiledShaderPtr& shader_ptr, ID3D12StateObject** rtpso,
+  StructuredBuffer* raygen_table, StructuredBuffer* hit_table, StructuredBuffer* miss_table)
 {
     StateObjectBuilder builder;
     builder.Init(12);
@@ -771,7 +782,7 @@ void DXRPathTracer::CreateRayTracingPSOs()
     {
         // DXIL library sub-object containing all of our code
         D3D12_DXIL_LIBRARY_DESC dxilDesc = { };
-        dxilDesc.DXILLibrary = rayTraceLib.ByteCode();
+        dxilDesc.DXILLibrary = shader_ptr.ByteCode();
         builder.AddSubObject(dxilDesc);
     }
 
@@ -817,6 +828,12 @@ void DXRPathTracer::CreateRayTracingPSOs()
         D3D12_RAYTRACING_SHADER_CONFIG shaderConfig = { };
         shaderConfig.MaxAttributeSizeInBytes = 2 * sizeof(float);                      // float2 barycentrics;
         shaderConfig.MaxPayloadSizeInBytes = 4 * sizeof(float) + 4 * sizeof(uint32);   // float3 radiance + float roughness + uint pathLength + uint pixelIdx + uint setIdx + bool IsDiffuse
+        if (rtpso == &rtPSOLoop_SER) {
+          shaderConfig.MaxPayloadSizeInBytes = 84;  // Hard code for the loop+SER one
+        }
+        else if (rtpso == &rtPSOLoop_my) {
+          shaderConfig.MaxPayloadSizeInBytes = 18 * 4;  // I just need some more
+        }
         builder.AddSubObject(shaderConfig);
     }
 
@@ -834,11 +851,13 @@ void DXRPathTracer::CreateRayTracingPSOs()
         builder.AddSubObject(configDesc);
     }
 
-    rtPSO = builder.CreateStateObject(D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE);
+    *rtpso = builder.CreateStateObject(D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE);
 
     // Get shader identifiers (for making shader records)
     ID3D12StateObjectProperties* psoProps = nullptr;
-    rtPSO->QueryInterface(IID_PPV_ARGS(&psoProps));
+    (*rtpso)->QueryInterface(IID_PPV_ARGS(&psoProps));
+    uint64_t pipeline_stack_size = psoProps->GetPipelineStackSize();
+    printf("Pipeline Stack Size = %llu\n", pipeline_stack_size);
 
     const void* rayGenID = psoProps->GetShaderIdentifier(L"RaygenShader");
     const void* hitGroupID = psoProps->GetShaderIdentifier(L"HitGroup");
@@ -858,7 +877,7 @@ void DXRPathTracer::CreateRayTracingPSOs()
         sbInit.InitData = rayGenRecords;
         sbInit.ShaderTable = true;
         sbInit.Name = L"Ray Gen Shader Table";
-        rtRayGenTable.Initialize(sbInit);
+        raygen_table->Initialize(sbInit);
     }
 
     {
@@ -870,7 +889,7 @@ void DXRPathTracer::CreateRayTracingPSOs()
         sbInit.InitData = missRecords;
         sbInit.ShaderTable = true;
         sbInit.Name = L"Miss Shader Table";
-        rtMissTable.Initialize(sbInit);
+        miss_table->Initialize(sbInit);
     }
 
     {
@@ -896,21 +915,23 @@ void DXRPathTracer::CreateRayTracingPSOs()
         sbInit.InitData = hitGroupRecords.Data();
         sbInit.ShaderTable = true;
         sbInit.Name = L"Hit Shader Table";
-        rtHitTable.Initialize(sbInit);
+        hit_table->Initialize(sbInit);
     }
 
     DX12::Release(psoProps);
+}
 
-    // RayQuery PSOs
-    {
-      D3D12_COMPUTE_PIPELINE_STATE_DESC cpsd{};
-      cpsd.pRootSignature = rtRootSignature;
-      cpsd.CS = rayTraceRayQueryCS.ByteCode();
-      DXCall(DX12::Device->CreateComputePipelineState(&cpsd, IID_PPV_ARGS(&rtRayQueryPSO)));
+void DXRPathTracer::CreateRayTracingRayQueryPSOs() {
+  // RayQuery PSOs
+  {
+    D3D12_COMPUTE_PIPELINE_STATE_DESC cpsd{};
+    cpsd.pRootSignature = rtRootSignature;
+    cpsd.CS = rayTraceRayQueryCS.ByteCode();
+    DXCall(DX12::Device->CreateComputePipelineState(&cpsd, IID_PPV_ARGS(&rtRayQueryPSO)));
 
-      cpsd.CS = rayTraceRayQuery1CS.ByteCode();
-      DXCall(DX12::Device->CreateComputePipelineState(&cpsd, IID_PPV_ARGS(&rtRayQuery1PSO)));
-    }
+    cpsd.CS = rayTraceRayQuery1CS.ByteCode();
+    DXCall(DX12::Device->CreateComputePipelineState(&cpsd, IID_PPV_ARGS(&rtRayQuery1PSO)));
+  }
 }
 
 void DXRPathTracer::Update(const Timer& timer)
@@ -1418,7 +1439,7 @@ void DXRPathTracer::RenderRayTracing()
 
     switch (g_render_path) {
     case 0: {
-      ProfileBlock pb(cmdList, "TraceRay DispatchRays");
+      ProfileBlock pb(cmdList, "TraceRay DispatchRays (original, recursive)");
       cmdList->SetPipelineState1(rtPSO);
       D3D12_DISPATCH_RAYS_DESC dispatchDesc = {};
       dispatchDesc.HitGroupTable = rtHitTable.ShaderTable();
@@ -1431,6 +1452,48 @@ void DXRPathTracer::RenderRayTracing()
       break;
     }
     case 1: {
+      ProfileBlock pb(cmdList, "TraceRay DispatchRays (recursive, SER)");
+      cmdList->SetPipelineState1(rtPSO_SER);
+      D3D12_DISPATCH_RAYS_DESC dispatchDesc = {};
+      dispatchDesc.HitGroupTable = rtHitTable_SER.ShaderTable();
+      dispatchDesc.MissShaderTable = rtMissTable_SER.ShaderTable();
+      dispatchDesc.RayGenerationShaderRecord = rtRayGenTable_SER.ShaderRecord(0);
+      dispatchDesc.Width = uint32(rtTarget.Width());
+      dispatchDesc.Height = uint32(rtTarget.Height());
+      dispatchDesc.Depth = 1;
+      DX12::CmdList->DispatchRays(&dispatchDesc);
+      break;
+      break;
+    }
+    case 2: {
+      ProfileBlock pb(cmdList, "TraceRay DispatchRays (loop, SER)");
+      cmdList->SetPipelineState1(rtPSOLoop_SER);
+      D3D12_DISPATCH_RAYS_DESC dispatchDesc = {};
+      dispatchDesc.HitGroupTable = rtHitTableLoop_SER.ShaderTable();
+      dispatchDesc.MissShaderTable = rtMissTableLoop_SER.ShaderTable();
+      dispatchDesc.RayGenerationShaderRecord = rtRayGenTableLoop_SER.ShaderRecord(0);
+      dispatchDesc.Width = uint32(rtTarget.Width());
+      dispatchDesc.Height = uint32(rtTarget.Height());
+      dispatchDesc.Depth = 1;
+      DX12::CmdList->DispatchRays(&dispatchDesc);
+      break;
+      break;
+    }
+    case 3: {
+      ProfileBlock pb(cmdList, "TraceRay DispatchRays (loop, my)");
+      cmdList->SetPipelineState1(rtPSOLoop_my);
+      D3D12_DISPATCH_RAYS_DESC dispatchDesc = {};
+      dispatchDesc.HitGroupTable = rtHitTableLoop_my.ShaderTable();
+      dispatchDesc.MissShaderTable = rtMissTableLoop_my.ShaderTable();
+      dispatchDesc.RayGenerationShaderRecord = rtRayGenTableLoop_my.ShaderRecord(0);
+      dispatchDesc.Width = uint32(rtTarget.Width());
+      dispatchDesc.Height = uint32(rtTarget.Height());
+      dispatchDesc.Depth = 1;
+      DX12::CmdList->DispatchRays(&dispatchDesc);
+      break;
+      break;
+    }
+    case 4: {
       ProfileBlock pb(cmdList, "RayQuery Dispatch (template)");
       cmdList->SetPipelineState(rtRayQueryPSO);
       uint32_t gx, gy;
@@ -1439,7 +1502,7 @@ void DXRPathTracer::RenderRayTracing()
       DX12::CmdList->Dispatch(gx, gy, 1);
       break;
     }
-    case 2: {
+    case 5: {
       ProfileBlock pb(cmdList, "RayQuery Dispatch (loop)");
       cmdList->SetPipelineState(rtRayQuery1PSO);
       uint32_t gx, gy;
