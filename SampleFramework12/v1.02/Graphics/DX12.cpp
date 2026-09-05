@@ -33,6 +33,7 @@ extern "C" { _declspec(dllexport) extern const char* D3D12SDKPath = ".\\D3D12\\"
 
 bool g_has_ser = false;
 bool g_use_ser = false;  // Actually use SER ?
+bool g_wavefront_reorder = false;
 
 namespace SampleFramework12
 {
@@ -125,10 +126,8 @@ void Initialize(D3D_FEATURE_LEVEL minFeatureLevel, uint32 adapterIdx)
     DXGI_ADAPTER_DESC1 desc = { };
     Adapter->GetDesc1(&desc);
     std::wstring deviceName(desc.Description);
-    if (deviceName.find(L"RTX 50") != std::wstring::npos) {
-      printf("Activating SER.\n");
-      g_use_ser = true;
-    }
+    if (deviceName.find(L"RTX 50") != std::wstring::npos)
+      printf("SER-capable adapter detected. SER paths remain opt-in.\n");
     WriteLog("Creating DX12 device on adapter '%ls'", deviceName.c_str());
 
     #if UseDebugDevice_

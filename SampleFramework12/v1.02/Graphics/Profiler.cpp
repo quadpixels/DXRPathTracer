@@ -23,7 +23,7 @@ namespace SampleFramework12
 
 Profiler Profiler::GlobalProfiler;
 
-static const uint64 MaxProfiles = 64;
+static const uint64 MaxProfiles = 128;
 
 struct ProfileData
 {
