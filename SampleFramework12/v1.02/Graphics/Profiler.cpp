@@ -12,9 +12,15 @@
 #include "DX12.h"
 #include "..\\Utility.h"
 #include "..\\ImGui\ImGui.h"
+#include <string>
 
 using std::wstring;
 using std::map;
+using std::string;
+
+extern bool g_wavefront_reorder;
+extern bool g_wavefront_skip_primary_sort;
+extern bool g_wavefront_block_sort;
 
 namespace SampleFramework12
 {
@@ -231,6 +237,153 @@ static void UpdateProfile(ProfileData& profile, uint64 profileIdx, bool drawText
     profile.Active = false;
 }
 
+static double AverageProfileTime(const ProfileData& profile)
+{
+    double avgTime = 0.0;
+    uint64 avgTimeSamples = 0;
+    for(UINT i = 0; i < ProfileData::FilterSize; ++i)
+    {
+        if(profile.TimeSamples[i] <= 0.0)
+            continue;
+
+        avgTime += profile.TimeSamples[i];
+        ++avgTimeSamples;
+    }
+
+    if(avgTimeSamples == 0)
+        return 0.0;
+
+    return avgTime / double(avgTimeSamples);
+}
+
+static double ProfileTimeByName(const Array<ProfileData>& profiles, uint64 numProfiles, const char* name)
+{
+    for(uint64 i = 0; i < numProfiles; ++i)
+    {
+        if(profiles[i].Name != nullptr && strcmp(profiles[i].Name, name) == 0)
+            return AverageProfileTime(profiles[i]);
+    }
+
+    return 0.0;
+}
+
+static void AppendTimingLine(string& text, const char* label, double time)
+{
+    char line[256] = { };
+    sprintf_s(line, "%-32s %.3f ms\r\n", label, time);
+    text += line;
+}
+
+static string BuildWavefrontTimingSummary(const Array<ProfileData>& profiles, uint64 numProfiles)
+{
+    static const char* TraceHitProfileNames[] =
+    {
+        "WF Trace Hits B0", "WF Trace Hits B1", "WF Trace Hits B2", "WF Trace Hits B3",
+        "WF Trace Hits B4", "WF Trace Hits B5", "WF Trace Hits B6", "WF Trace Hits B7",
+    };
+
+    static const char* HitSortProfileNames[] =
+    {
+        "WF Hit Sort B0", "WF Hit Sort B1", "WF Hit Sort B2", "WF Hit Sort B3",
+        "WF Hit Sort B4", "WF Hit Sort B5", "WF Hit Sort B6", "WF Hit Sort B7",
+    };
+
+    static const char* ShadeHitProfileNames[] =
+    {
+        "WF Shade Hits B0", "WF Shade Hits B1", "WF Shade Hits B2", "WF Shade Hits B3",
+        "WF Shade Hits B4", "WF Shade Hits B5", "WF Shade Hits B6", "WF Shade Hits B7",
+    };
+
+    static const char* TraceShadowProfileNames[] =
+    {
+        "WF Trace Shadows B0", "WF Trace Shadows B1", "WF Trace Shadows B2", "WF Trace Shadows B3",
+        "WF Trace Shadows B4", "WF Trace Shadows B5", "WF Trace Shadows B6", "WF Trace Shadows B7",
+    };
+
+    static const char* AdvanceProfileNames[] =
+    {
+        "WF Advance B0", "WF Advance B1", "WF Advance B2", "WF Advance B3",
+        "WF Advance B4", "WF Advance B5", "WF Advance B6", "WF Advance B7",
+    };
+
+    static const char* PrepareAfterTraceProfileNames[] =
+    {
+        "WF Prepare Args After Trace B0", "WF Prepare Args After Trace B1", "WF Prepare Args After Trace B2", "WF Prepare Args After Trace B3",
+        "WF Prepare Args After Trace B4", "WF Prepare Args After Trace B5", "WF Prepare Args After Trace B6", "WF Prepare Args After Trace B7",
+    };
+
+    static const char* PrepareAfterShadeProfileNames[] =
+    {
+        "WF Prepare Args After Shade B0", "WF Prepare Args After Shade B1", "WF Prepare Args After Shade B2", "WF Prepare Args After Shade B3",
+        "WF Prepare Args After Shade B4", "WF Prepare Args After Shade B5", "WF Prepare Args After Shade B6", "WF Prepare Args After Shade B7",
+    };
+
+    double traceTotal = 0.0;
+    double sortTotal = 0.0;
+    double shadeTotal = 0.0;
+    double shadowTotal = 0.0;
+    double advanceTotal = 0.0;
+    double prepareTotal = ProfileTimeByName(profiles, numProfiles, "WF Prepare Args Initial");
+    const char* sortMode = "None";
+    if(g_wavefront_reorder)
+        sortMode = g_wavefront_block_sort ? "Thread Block" : "Global";
+
+    for(uint64 bounce = 0; bounce < ArraySize_(TraceHitProfileNames); ++bounce)
+    {
+        const bool includeGlobalSort = g_wavefront_reorder && g_wavefront_block_sort == false &&
+                                       (bounce > 0 || g_wavefront_skip_primary_sort == false);
+
+        traceTotal += ProfileTimeByName(profiles, numProfiles, TraceHitProfileNames[bounce]);
+        if(includeGlobalSort)
+            sortTotal += ProfileTimeByName(profiles, numProfiles, HitSortProfileNames[bounce]);
+        shadeTotal += ProfileTimeByName(profiles, numProfiles, ShadeHitProfileNames[bounce]);
+        shadowTotal += ProfileTimeByName(profiles, numProfiles, TraceShadowProfileNames[bounce]);
+        advanceTotal += ProfileTimeByName(profiles, numProfiles, AdvanceProfileNames[bounce]);
+        prepareTotal += ProfileTimeByName(profiles, numProfiles, PrepareAfterTraceProfileNames[bounce]);
+        prepareTotal += ProfileTimeByName(profiles, numProfiles, PrepareAfterShadeProfileNames[bounce]);
+    }
+
+    string text;
+    text += "Wavefront GPU timing summary\r\n";
+    text += "============================\r\n";
+    text += "Sort Mode: ";
+    text += sortMode;
+    text += g_wavefront_skip_primary_sort ? " (skip B0)\r\n" : " (include B0)\r\n";
+    AppendTimingLine(text, "RayQuery Wavefront Dispatch", ProfileTimeByName(profiles, numProfiles, "RayQuery Wavefront Dispatch"));
+    AppendTimingLine(text, "WF Clear", ProfileTimeByName(profiles, numProfiles, "WF Clear"));
+    AppendTimingLine(text, "WF Generate Primary", ProfileTimeByName(profiles, numProfiles, "WF Generate Primary"));
+    AppendTimingLine(text, "WF Trace Hits Total", traceTotal);
+    AppendTimingLine(text, "WF Global Hit Sort Total", sortTotal);
+    AppendTimingLine(text, "WF Shade Hits Total", shadeTotal);
+    AppendTimingLine(text, "WF Trace Shadows Total", shadowTotal);
+    AppendTimingLine(text, "WF Prepare Args Total", prepareTotal);
+    AppendTimingLine(text, "WF Advance Total", advanceTotal);
+    AppendTimingLine(text, "WF Accumulate", ProfileTimeByName(profiles, numProfiles, "WF Accumulate"));
+    text += "\r\nPer-bounce detail\r\n";
+
+    for(uint64 bounce = 0; bounce < ArraySize_(TraceHitProfileNames); ++bounce)
+    {
+        char label[64] = { };
+        sprintf_s(label, "B%llu Trace Hits", bounce);
+        AppendTimingLine(text, label, ProfileTimeByName(profiles, numProfiles, TraceHitProfileNames[bounce]));
+
+        sprintf_s(label, "B%llu Hit Sort", bounce);
+        if(g_wavefront_reorder && g_wavefront_block_sort == false &&
+           (bounce > 0 || g_wavefront_skip_primary_sort == false))
+            AppendTimingLine(text, label, ProfileTimeByName(profiles, numProfiles, HitSortProfileNames[bounce]));
+        else
+            AppendTimingLine(text, label, 0.0);
+
+        sprintf_s(label, "B%llu Shade Hits", bounce);
+        AppendTimingLine(text, label, ProfileTimeByName(profiles, numProfiles, ShadeHitProfileNames[bounce]));
+
+        sprintf_s(label, "B%llu Trace Shadows", bounce);
+        AppendTimingLine(text, label, ProfileTimeByName(profiles, numProfiles, TraceShadowProfileNames[bounce]));
+    }
+
+    return text;
+}
+
 void Profiler::EndFrame(uint32 displayWidth, uint32 displayHeight)
 {
     uint64 gpuFrequency = 0;
@@ -298,6 +451,12 @@ void Profiler::EndFrame(uint32 displayWidth, uint32 displayHeight)
 
         ImGui::Text(" ");
         logToClipboard = ImGui::Button("Copy To Clipboard");
+        ImGui::SameLine();
+        if(ImGui::Button("Copy Wavefront Summary"))
+        {
+            const string summary = BuildWavefrontTimingSummary(profiles, numProfiles);
+            ImGui::SetClipboardText(summary.c_str());
+        }
     }
     else
         logToClipboard = false;

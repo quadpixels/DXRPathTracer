@@ -34,6 +34,8 @@ extern "C" { _declspec(dllexport) extern const char* D3D12SDKPath = ".\\D3D12\\"
 bool g_has_ser = false;
 bool g_use_ser = false;  // Actually use SER ?
 bool g_wavefront_reorder = false;
+bool g_wavefront_skip_primary_sort = true;
+bool g_wavefront_block_sort = false;
 
 namespace SampleFramework12
 {

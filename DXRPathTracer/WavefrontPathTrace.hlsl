@@ -144,12 +144,16 @@ static const uint PathFlag_Diffuse = 1u;
 static const uint QueueA = 0u;
 static const uint QueueB = 1u;
 static const uint RayTraceFlag_EnableWavefrontReorder = 2u;
+static const uint RayTraceFlag_EnableWavefrontBlockSort = 4u;
 static const uint NumReorderBins = 64u;
 static const uint DispatchArgs_CurrentRays = 0u;
 static const uint DispatchArgs_Hits = 1u;
 static const uint DispatchArgs_Shadows = 2u;
 static const uint DispatchArgs_HitMeta = 3u;
 static const uint DispatchArgsStrideBytes = 12u;
+
+groupshared HitWorkItem SharedBlockSortHits[64];
+groupshared uint SharedBlockSortKeys[64];
 
 static float2 SamplePoint(in uint pixelIdx, inout uint setIdx)
 {
@@ -660,13 +664,67 @@ void WavefrontPrepareDispatchArgsCS(uint3 dispatchThreadID : SV_DispatchThreadID
 }
 
 [numthreads(64, 1, 1)]
-void WavefrontShadeHitsCS(uint3 dispatchThreadID : SV_DispatchThreadID)
+void WavefrontShadeHitsCS(uint3 dispatchThreadID : SV_DispatchThreadID, uint groupIndex : SV_GroupIndex)
 {
     const uint workIdx = dispatchThreadID.x;
-    if(workIdx >= WavefrontCounters[Counter_Hits])
+    const uint numHits = WavefrontCounters[Counter_Hits];
+    const bool validWork = workIdx < numHits;
+
+    HitWorkItem hitItem;
+    if(validWork)
+        hitItem = LoadHitWorkItem(RayTraceCB.WavefrontReadQueue, workIdx);
+    else
+    {
+        hitItem.PathStateIdx = 0;
+        hitItem.GeometryIdx = 0xFFFFFFFFu;
+        hitItem.PrimitiveIdx = 0xFFFFFFFFu;
+        hitItem.Bary = 0.0.xx;
+        hitItem.RayOrigin = 0.0.xxx;
+        hitItem.RayT = 0.0f;
+        hitItem.RayDirection = 0.0.xxx;
+        hitItem.Padding = 0;
+    }
+
+    if((RayTraceCB.myFlags & RayTraceFlag_EnableWavefrontBlockSort) != 0u)
+    {
+        SharedBlockSortHits[groupIndex] = hitItem;
+        SharedBlockSortKeys[groupIndex] = validWork ? WavefrontHitSortKey(hitItem) : 0xFFFFFFFFu;
+        GroupMemoryBarrierWithGroupSync();
+
+        for(uint sortSize = 2u; sortSize <= 64u; sortSize <<= 1u)
+        {
+            for(uint compareDistance = sortSize >> 1u; compareDistance > 0u; compareDistance >>= 1u)
+            {
+                const uint partnerIndex = groupIndex ^ compareDistance;
+                if(partnerIndex > groupIndex)
+                {
+                    const bool ascending = (groupIndex & sortSize) == 0u;
+                    const uint selfKey = SharedBlockSortKeys[groupIndex];
+                    const uint partnerKey = SharedBlockSortKeys[partnerIndex];
+                    const bool shouldSwap = ascending ? (selfKey > partnerKey) : (selfKey < partnerKey);
+
+                    if(shouldSwap)
+                    {
+                        const uint tempKey = SharedBlockSortKeys[groupIndex];
+                        SharedBlockSortKeys[groupIndex] = SharedBlockSortKeys[partnerIndex];
+                        SharedBlockSortKeys[partnerIndex] = tempKey;
+
+                        const HitWorkItem tempHit = SharedBlockSortHits[groupIndex];
+                        SharedBlockSortHits[groupIndex] = SharedBlockSortHits[partnerIndex];
+                        SharedBlockSortHits[partnerIndex] = tempHit;
+                    }
+                }
+
+                GroupMemoryBarrierWithGroupSync();
+            }
+        }
+
+        hitItem = SharedBlockSortHits[groupIndex];
+    }
+
+    if(validWork == false || hitItem.GeometryIdx == 0xFFFFFFFFu)
         return;
 
-    HitWorkItem hitItem = LoadHitWorkItem(RayTraceCB.WavefrontReadQueue, workIdx);
     PathState state = PathStates[hitItem.PathStateIdx];
 
     MeshVertex hitSurface = GetHitSurface_RQ(hitItem.Bary, hitItem.GeometryIdx, hitItem.PrimitiveIdx);

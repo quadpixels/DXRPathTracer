@@ -19,6 +19,8 @@ extern int g_render_path;
 extern bool g_has_ser;
 extern bool g_use_ser;
 extern bool g_wavefront_reorder;
+extern bool g_wavefront_skip_primary_sort;
+extern bool g_wavefront_block_sort;
 
 namespace SampleFramework12
 {
@@ -864,6 +866,8 @@ void SettingsContainer::Update(uint32 displayWidth, uint32 displayHeight, const 
       ImGui::Checkbox("Use SER", &g_use_ser);
     }
     ImGui::Checkbox("Wavefront Hit Sort", &g_wavefront_reorder);
+    ImGui::Checkbox("Skip Primary Hit Sort", &g_wavefront_skip_primary_sort);
+    ImGui::Checkbox("Thread Block Hit Sort", &g_wavefront_block_sort);
     ImGui::RadioButton("DXR1.0 (original)", &g_render_path, 0);
     ImGui::RadioButton("DXR1.0 (recursion, SER)", &g_render_path, 1);
     ImGui::RadioButton("DXR1.0 (loop, SER)", &g_render_path, 2);

@@ -33,6 +33,8 @@
 extern bool g_has_ser;
 extern bool g_use_ser;
 extern bool g_wavefront_reorder;
+extern bool g_wavefront_skip_primary_sort;
+extern bool g_wavefront_block_sort;
 
 using namespace SampleFramework12;
 
@@ -1620,9 +1622,6 @@ void DXRPathTracer::RenderRayTracing()
     if (g_has_ser && g_use_ser) {
       rtConstants.myFlags |= 1;
     }
-    if (g_wavefront_reorder) {
-      rtConstants.myFlags |= 2;
-    }
 
     DX12::BindTempConstantBuffer(cmdList, rtConstants, RTParams_CBuffer, CmdListMode::Compute);
 
@@ -1834,6 +1833,14 @@ void DXRPathTracer::RenderRayTracing()
 
       auto bindWavefrontConstants = [&](uint32 bounce, uint32 readQueue, uint32 writeQueue)
       {
+          const bool sortThisBounce = g_wavefront_reorder && (bounce > 0 || g_wavefront_skip_primary_sort == false);
+
+          rtConstants.myFlags &= ~(2u | 4u);
+          if(sortThisBounce && g_wavefront_block_sort == false)
+              rtConstants.myFlags |= 2u;
+          else if(sortThisBounce && g_wavefront_block_sort)
+              rtConstants.myFlags |= 4u;
+
           rtConstants.WavefrontBounce = bounce;
           rtConstants.WavefrontReadQueue = readQueue;
           rtConstants.WavefrontWriteQueue = writeQueue;
@@ -1896,7 +1903,8 @@ void DXRPathTracer::RenderRayTracing()
           prepareWavefrontDispatchArgs(PrepareAfterTraceProfileNames[bounce]);
 
           uint32 hitReadQueue = currentQueue;
-          if(g_wavefront_reorder)
+          if(g_wavefront_reorder && g_wavefront_block_sort == false &&
+             (bounce > 0 || g_wavefront_skip_primary_sort == false))
           {
               const uint32 hitWriteQueue = hitReadQueue ^ 1;
               bindWavefrontConstants(bounce, hitReadQueue, hitWriteQueue);
