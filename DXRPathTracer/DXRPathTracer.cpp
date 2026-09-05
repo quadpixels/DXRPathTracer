@@ -160,6 +160,10 @@ struct WavefrontShadowWorkItem
     float TMax = 0.0f;
     Float3 Contribution;
     uint32 PathStateIdx = 0;
+    uint32 RayFlags = 0;
+    uint32 Padding0 = 0;
+    uint32 Padding1 = 0;
+    uint32 Padding2 = 0;
 };
 
 struct WavefrontHitWorkItem

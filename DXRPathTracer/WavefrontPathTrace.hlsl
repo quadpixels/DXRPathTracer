@@ -84,6 +84,10 @@ struct ShadowWorkItem
     float TMax;
     float3 Contribution;
     uint PathStateIdx;
+    uint RayFlags;
+    uint Padding0;
+    uint Padding1;
+    uint Padding2;
 };
 
 struct HitWorkItem
@@ -355,6 +359,10 @@ static bool ShadeSurfaceAndSampleNext(
     outSunShadow.TMax = 0.0f;
     outSunShadow.Contribution = 0.0.xxx;
     outSunShadow.PathStateIdx = 0;
+    outSunShadow.RayFlags = 0;
+    outSunShadow.Padding0 = 0;
+    outSunShadow.Padding1 = 0;
+    outSunShadow.Padding2 = 0;
     outNext.Valid = false;
     outNext.DirWS = 0.0.xxx;
     outNext.Throughput = 0.0.xxx;
@@ -440,6 +448,9 @@ static bool ShadeSurfaceAndSampleNext(
         outSunShadow.TMin = 0.00001f;
         outSunShadow.Direction = RayTraceCB.SunDirectionWS;
         outSunShadow.TMax = FP32Max;
+        outSunShadow.RayFlags = RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH;
+        if(pathLength > AppSettings.MaxAnyHitPathLength)
+            outSunShadow.RayFlags |= RAY_FLAG_FORCE_OPAQUE;
         outSunContribution = CalcLighting(normalWS, sunDirection, RayTraceCB.SunIrradiance, diffuseAlbedo, specularAlbedo,
                                           roughness, positionWS, incomingRayOriginWS, msEnergyCompensation);
     }
@@ -972,11 +983,7 @@ void WavefrontTraceShadowsCS(uint3 dispatchThreadID : SV_DispatchThreadID)
     ray.TMin = shadow.TMin;
     ray.TMax = shadow.TMax;
 
-    uint rayFlags = RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH;
-    if(state.PathLength > AppSettings.MaxAnyHitPathLength)
-        rayFlags |= RAY_FLAG_FORCE_OPAQUE;
-
-    const float visibility = TraceShadowInline(ray, 0xFFFFFFFF, rayFlags);
+    const float visibility = TraceShadowInline(ray, 0xFFFFFFFF, shadow.RayFlags);
     state.Radiance += visibility * shadow.Contribution;
     PathStates[shadow.PathStateIdx] = state;
 }
