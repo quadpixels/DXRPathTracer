@@ -21,6 +21,7 @@ extern bool g_use_ser;
 extern bool g_wavefront_reorder;
 extern bool g_wavefront_skip_primary_sort;
 extern bool g_wavefront_block_sort;
+extern bool g_wavefront_wave_append;
 
 namespace SampleFramework12
 {
@@ -868,6 +869,7 @@ void SettingsContainer::Update(uint32 displayWidth, uint32 displayHeight, const 
     ImGui::Checkbox("Wavefront Hit Sort", &g_wavefront_reorder);
     ImGui::Checkbox("Skip Primary Hit Sort", &g_wavefront_skip_primary_sort);
     ImGui::Checkbox("Thread Block Hit Sort", &g_wavefront_block_sort);
+    ImGui::Checkbox("Wavefront Wave Append", &g_wavefront_wave_append);
     ImGui::RadioButton("DXR1.0 (original)", &g_render_path, 0);
     ImGui::RadioButton("DXR1.0 (recursion, SER)", &g_render_path, 1);
     ImGui::RadioButton("DXR1.0 (loop, SER)", &g_render_path, 2);
@@ -875,6 +877,7 @@ void SettingsContainer::Update(uint32 displayWidth, uint32 displayHeight, const 
     ImGui::RadioButton("DXR1.1 (template recursion)", &g_render_path, 4);
     ImGui::RadioButton("DXR1.1 (loop-based)", &g_render_path, 5);
     ImGui::RadioButton("DXR1.1 (wavefront queues)", &g_render_path, 6);
+    ImGui::RadioButton("DXR1.1 (persistent workers)", &g_render_path, 7);
 
     for(uint64 groupIdx = 0; groupIdx < groups.Count(); ++groupIdx)
     {

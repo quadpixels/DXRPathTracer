@@ -21,6 +21,7 @@ using std::string;
 extern bool g_wavefront_reorder;
 extern bool g_wavefront_skip_primary_sort;
 extern bool g_wavefront_block_sort;
+extern bool g_wavefront_wave_append;
 
 namespace SampleFramework12
 {
@@ -318,6 +319,36 @@ static string BuildWavefrontTimingSummary(const Array<ProfileData>& profiles, ui
         "WF Prepare Args After Shade B4", "WF Prepare Args After Shade B5", "WF Prepare Args After Shade B6", "WF Prepare Args After Shade B7",
     };
 
+    static const char* PersistentPrepareProfileNames[] =
+    {
+        "Persistent Prepare B0", "Persistent Prepare B1", "Persistent Prepare B2", "Persistent Prepare B3",
+        "Persistent Prepare B4", "Persistent Prepare B5", "Persistent Prepare B6", "Persistent Prepare B7",
+    };
+
+    static const char* PersistentTraceShadeProfileNames[] =
+    {
+        "Persistent Trace+Shade B0", "Persistent Trace+Shade B1", "Persistent Trace+Shade B2", "Persistent Trace+Shade B3",
+        "Persistent Trace+Shade B4", "Persistent Trace+Shade B5", "Persistent Trace+Shade B6", "Persistent Trace+Shade B7",
+    };
+
+    static const char* PersistentPrepareArgsProfileNames[] =
+    {
+        "Persistent Prepare Args B0", "Persistent Prepare Args B1", "Persistent Prepare Args B2", "Persistent Prepare Args B3",
+        "Persistent Prepare Args B4", "Persistent Prepare Args B5", "Persistent Prepare Args B6", "Persistent Prepare Args B7",
+    };
+
+    static const char* PersistentTraceShadowProfileNames[] =
+    {
+        "Persistent Trace Shadows B0", "Persistent Trace Shadows B1", "Persistent Trace Shadows B2", "Persistent Trace Shadows B3",
+        "Persistent Trace Shadows B4", "Persistent Trace Shadows B5", "Persistent Trace Shadows B6", "Persistent Trace Shadows B7",
+    };
+
+    static const char* PersistentAdvanceProfileNames[] =
+    {
+        "Persistent Advance B0", "Persistent Advance B1", "Persistent Advance B2", "Persistent Advance B3",
+        "Persistent Advance B4", "Persistent Advance B5", "Persistent Advance B6", "Persistent Advance B7",
+    };
+
     double traceTotal = 0.0;
     double sortTotal = 0.0;
     double shadeTotal = 0.0;
@@ -349,6 +380,8 @@ static string BuildWavefrontTimingSummary(const Array<ProfileData>& profiles, ui
     text += "Sort Mode: ";
     text += sortMode;
     text += g_wavefront_skip_primary_sort ? " (skip B0)\r\n" : " (include B0)\r\n";
+    text += "Append Mode: ";
+    text += g_wavefront_wave_append ? "Wave aggregated atomics\r\n" : "Per-item atomics\r\n";
     AppendTimingLine(text, "RayQuery Wavefront Dispatch", ProfileTimeByName(profiles, numProfiles, "RayQuery Wavefront Dispatch"));
     AppendTimingLine(text, "WF Clear", ProfileTimeByName(profiles, numProfiles, "WF Clear"));
     AppendTimingLine(text, "WF Generate Primary", ProfileTimeByName(profiles, numProfiles, "WF Generate Primary"));
@@ -379,6 +412,48 @@ static string BuildWavefrontTimingSummary(const Array<ProfileData>& profiles, ui
 
         sprintf_s(label, "B%llu Trace Shadows", bounce);
         AppendTimingLine(text, label, ProfileTimeByName(profiles, numProfiles, TraceShadowProfileNames[bounce]));
+    }
+
+    const double persistentTotal = ProfileTimeByName(profiles, numProfiles, "RayQuery Persistent Workers Dispatch");
+    if(persistentTotal > 0.0)
+    {
+        double persistentPrepareTotal = 0.0;
+        double persistentTraceShadeTotal = 0.0;
+        double persistentPrepareArgsTotal = 0.0;
+        double persistentShadowTotal = 0.0;
+        double persistentAdvanceTotal = 0.0;
+
+        for(uint64 bounce = 0; bounce < ArraySize_(PersistentTraceShadeProfileNames); ++bounce)
+        {
+            persistentPrepareTotal += ProfileTimeByName(profiles, numProfiles, PersistentPrepareProfileNames[bounce]);
+            persistentTraceShadeTotal += ProfileTimeByName(profiles, numProfiles, PersistentTraceShadeProfileNames[bounce]);
+            persistentPrepareArgsTotal += ProfileTimeByName(profiles, numProfiles, PersistentPrepareArgsProfileNames[bounce]);
+            persistentShadowTotal += ProfileTimeByName(profiles, numProfiles, PersistentTraceShadowProfileNames[bounce]);
+            persistentAdvanceTotal += ProfileTimeByName(profiles, numProfiles, PersistentAdvanceProfileNames[bounce]);
+        }
+
+        text += "\r\nPersistent GPU timing summary\r\n";
+        text += "=============================\r\n";
+        AppendTimingLine(text, "RayQuery Persistent Workers", persistentTotal);
+        AppendTimingLine(text, "Persistent Clear", ProfileTimeByName(profiles, numProfiles, "Persistent Clear"));
+        AppendTimingLine(text, "Persistent Generate Primary", ProfileTimeByName(profiles, numProfiles, "Persistent Generate Primary"));
+        AppendTimingLine(text, "Persistent Prepare Total", persistentPrepareTotal);
+        AppendTimingLine(text, "Persistent Trace+Shade Total", persistentTraceShadeTotal);
+        AppendTimingLine(text, "Persistent Prepare Args Total", persistentPrepareArgsTotal);
+        AppendTimingLine(text, "Persistent Trace Shadows Total", persistentShadowTotal);
+        AppendTimingLine(text, "Persistent Advance Total", persistentAdvanceTotal);
+        AppendTimingLine(text, "Persistent Accumulate", ProfileTimeByName(profiles, numProfiles, "Persistent Accumulate"));
+        text += "\r\nPersistent per-bounce detail\r\n";
+
+        for(uint64 bounce = 0; bounce < ArraySize_(PersistentTraceShadeProfileNames); ++bounce)
+        {
+            char label[64] = { };
+            sprintf_s(label, "B%llu Persistent Trace+Shade", bounce);
+            AppendTimingLine(text, label, ProfileTimeByName(profiles, numProfiles, PersistentTraceShadeProfileNames[bounce]));
+
+            sprintf_s(label, "B%llu Persistent Shadows", bounce);
+            AppendTimingLine(text, label, ProfileTimeByName(profiles, numProfiles, PersistentTraceShadowProfileNames[bounce]));
+        }
     }
 
     return text;

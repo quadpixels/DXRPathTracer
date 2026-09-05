@@ -35,6 +35,7 @@ extern bool g_use_ser;
 extern bool g_wavefront_reorder;
 extern bool g_wavefront_skip_primary_sort;
 extern bool g_wavefront_block_sort;
+extern bool g_wavefront_wave_append;
 
 using namespace SampleFramework12;
 
@@ -60,7 +61,7 @@ StaticAssert_(ArraySize_(SceneCameraPositions) == uint64(Scenes::NumValues));
 StaticAssert_(ArraySize_(SceneCameraRotations) == uint64(Scenes::NumValues));
 StaticAssert_(ArraySize_(SceneSunDirections) == uint64(Scenes::NumValues));
 
-int g_render_path = 0;  // 0=DXR1.0 original, 1=DXR1.0 SER, 2=DXR1.0 loop SER, 3=DXR1.0 loop my, 4=DXR1.1 recursion, 5=DXR1.1 loop, 6=DXR1.1 wavefront
+int g_render_path = 0;  // 0=DXR1.0 original, 1=DXR1.0 SER, 2=DXR1.0 loop SER, 3=DXR1.0 loop my, 4=DXR1.1 recursion, 5=DXR1.1 loop, 6=DXR1.1 wavefront, 7=DXR1.1 persistent workers
 
 static const uint64 NumConeSides = 16;
 
@@ -603,6 +604,8 @@ void DXRPathTracer::DestroyPSOs()
     DX12::DeferredRelease(wavefrontShadeHitsPSO);
     DX12::DeferredRelease(wavefrontTraceShadowsPSO);
     DX12::DeferredRelease(wavefrontPrepareDispatchArgsPSO);
+    DX12::DeferredRelease(wavefrontPreparePersistentBouncePSO);
+    DX12::DeferredRelease(wavefrontPersistentTraceShadePSO);
     DX12::DeferredRelease(wavefrontClearReorderPSO);
     DX12::DeferredRelease(wavefrontCountReorderBinsPSO);
     DX12::DeferredRelease(wavefrontPrefixReorderBinsPSO);
@@ -737,7 +740,7 @@ void DXRPathTracer::CreateRenderTargets()
         wavefrontHitQueueB.Initialize(sbInit);
 
         sbInit.Stride = sizeof(uint32);
-        sbInit.NumElements = 132;
+        sbInit.NumElements = 133;
         sbInit.Name = L"Wavefront Counters";
         wavefrontCounterBuffer.Initialize(sbInit);
 
@@ -911,6 +914,8 @@ void DXRPathTracer::InitRayTracing()
     wavefrontShadeHitsCS = CompileFromFile(L"WavefrontPathTrace.hlsl", "WavefrontShadeHitsCS", ShaderType::Compute, co);
     wavefrontTraceShadowsCS = CompileFromFile(L"WavefrontPathTrace.hlsl", "WavefrontTraceShadowsCS", ShaderType::Compute, co);
     wavefrontPrepareDispatchArgsCS = CompileFromFile(L"WavefrontPathTrace.hlsl", "WavefrontPrepareDispatchArgsCS", ShaderType::Compute, co);
+    wavefrontPreparePersistentBounceCS = CompileFromFile(L"WavefrontPathTrace.hlsl", "WavefrontPreparePersistentBounceCS", ShaderType::Compute, co);
+    wavefrontPersistentTraceShadeCS = CompileFromFile(L"WavefrontPathTrace.hlsl", "WavefrontPersistentTraceShadeCS", ShaderType::Compute, co);
     wavefrontClearReorderCS = CompileFromFile(L"WavefrontPathTrace.hlsl", "WavefrontClearReorderCS", ShaderType::Compute, co);
     wavefrontCountReorderBinsCS = CompileFromFile(L"WavefrontPathTrace.hlsl", "WavefrontCountReorderBinsCS", ShaderType::Compute, co);
     wavefrontPrefixReorderBinsCS = CompileFromFile(L"WavefrontPathTrace.hlsl", "WavefrontPrefixReorderBinsCS", ShaderType::Compute, co);
@@ -1095,6 +1100,12 @@ void DXRPathTracer::CreateRayTracingRayQueryPSOs() {
 
     cpsd.CS = wavefrontPrepareDispatchArgsCS.ByteCode();
     DXCall(DX12::Device->CreateComputePipelineState(&cpsd, IID_PPV_ARGS(&wavefrontPrepareDispatchArgsPSO)));
+
+    cpsd.CS = wavefrontPreparePersistentBounceCS.ByteCode();
+    DXCall(DX12::Device->CreateComputePipelineState(&cpsd, IID_PPV_ARGS(&wavefrontPreparePersistentBouncePSO)));
+
+    cpsd.CS = wavefrontPersistentTraceShadeCS.ByteCode();
+    DXCall(DX12::Device->CreateComputePipelineState(&cpsd, IID_PPV_ARGS(&wavefrontPersistentTraceShadePSO)));
 
     cpsd.CS = wavefrontClearReorderCS.ByteCode();
     DXCall(DX12::Device->CreateComputePipelineState(&cpsd, IID_PPV_ARGS(&wavefrontClearReorderPSO)));
@@ -1622,6 +1633,9 @@ void DXRPathTracer::RenderRayTracing()
     if (g_has_ser && g_use_ser) {
       rtConstants.myFlags |= 1;
     }
+    if (g_wavefront_wave_append) {
+      rtConstants.myFlags |= 8;
+    }
 
     DX12::BindTempConstantBuffer(cmdList, rtConstants, RTParams_CBuffer, CmdListMode::Compute);
 
@@ -1644,6 +1658,8 @@ void DXRPathTracer::RenderRayTracing()
         activeRenderPath = 0;
     else if(activeRenderPath == 6 && wavefrontTraceHitsPSO == nullptr)
         activeRenderPath = 5;
+    else if(activeRenderPath == 7 && wavefrontPersistentTraceShadePSO == nullptr)
+        activeRenderPath = 6;
 
     switch (activeRenderPath) {
     case 0: {
@@ -1973,6 +1989,192 @@ void DXRPathTracer::RenderRayTracing()
       bindWavefrontConstants(0, 0, 1);
       {
           ProfileBlock accumulatePB(cmdList, "WF Accumulate");
+          cmdList->SetPipelineState(wavefrontAccumulatePSO);
+          DX12::CmdList->Dispatch(gx, gy, 1);
+          wavefrontPathStateBuffer.UAVBarrier(cmdList);
+          rtTarget.UAVBarrier(cmdList);
+      }
+      break;
+    }
+    case 7: {
+      ProfileBlock pb(cmdList, "RayQuery Persistent Workers Dispatch");
+
+      static const char* PersistentPrepareProfileNames[] =
+      {
+          "Persistent Prepare B0",
+          "Persistent Prepare B1",
+          "Persistent Prepare B2",
+          "Persistent Prepare B3",
+          "Persistent Prepare B4",
+          "Persistent Prepare B5",
+          "Persistent Prepare B6",
+          "Persistent Prepare B7",
+      };
+
+      static const char* PersistentTraceShadeProfileNames[] =
+      {
+          "Persistent Trace+Shade B0",
+          "Persistent Trace+Shade B1",
+          "Persistent Trace+Shade B2",
+          "Persistent Trace+Shade B3",
+          "Persistent Trace+Shade B4",
+          "Persistent Trace+Shade B5",
+          "Persistent Trace+Shade B6",
+          "Persistent Trace+Shade B7",
+      };
+
+      static const char* PersistentPrepareArgsProfileNames[] =
+      {
+          "Persistent Prepare Args B0",
+          "Persistent Prepare Args B1",
+          "Persistent Prepare Args B2",
+          "Persistent Prepare Args B3",
+          "Persistent Prepare Args B4",
+          "Persistent Prepare Args B5",
+          "Persistent Prepare Args B6",
+          "Persistent Prepare Args B7",
+      };
+
+      static const char* PersistentTraceShadowProfileNames[] =
+      {
+          "Persistent Trace Shadows B0",
+          "Persistent Trace Shadows B1",
+          "Persistent Trace Shadows B2",
+          "Persistent Trace Shadows B3",
+          "Persistent Trace Shadows B4",
+          "Persistent Trace Shadows B5",
+          "Persistent Trace Shadows B6",
+          "Persistent Trace Shadows B7",
+      };
+
+      static const char* PersistentAdvanceProfileNames[] =
+      {
+          "Persistent Advance B0",
+          "Persistent Advance B1",
+          "Persistent Advance B2",
+          "Persistent Advance B3",
+          "Persistent Advance B4",
+          "Persistent Advance B5",
+          "Persistent Advance B6",
+          "Persistent Advance B7",
+      };
+
+      D3D12_CPU_DESCRIPTOR_HANDLE uavs[] =
+      {
+          rtTarget.UAV,
+          wavefrontPathStateBuffer.UAV,
+          wavefrontRayQueueA.UAV,
+          wavefrontRayQueueB.UAV,
+          wavefrontShadowQueue.UAV,
+          wavefrontCounterBuffer.UAV,
+          wavefrontHitQueueA.UAV,
+          wavefrontHitQueueB.UAV,
+          wavefrontDispatchArgsBuffer.UAV,
+      };
+      DX12::BindTempDescriptorTable(cmdList, uavs, ArraySize_(uavs), RTParams_UAVDescriptor, CmdListMode::Compute);
+
+      const uint32 width = uint32(rtTarget.Width());
+      const uint32 height = uint32(rtTarget.Height());
+      const uint32 numPixels = width * height;
+      const uint32 pixelGroups = (numPixels + 63) / 64;
+      const uint32 persistentGroups = Min<uint32>(pixelGroups, 1024);
+      const uint32 gx = (width + 7) / 8;
+      const uint32 gy = (height + 7) / 8;
+      const uint64 dispatchArgsStride = sizeof(D3D12_DISPATCH_ARGUMENTS);
+      const uint64 shadowDispatchArgsOffset = 2 * dispatchArgsStride;
+      D3D12_RESOURCE_STATES dispatchArgsState = D3D12_RESOURCE_STATE_COMMON;
+
+      auto bindWavefrontConstants = [&](uint32 bounce, uint32 readQueue, uint32 writeQueue)
+      {
+          rtConstants.myFlags &= ~(2u | 4u);
+          rtConstants.WavefrontBounce = bounce;
+          rtConstants.WavefrontReadQueue = readQueue;
+          rtConstants.WavefrontWriteQueue = writeQueue;
+          DX12::BindTempConstantBuffer(cmdList, rtConstants, RTParams_CBuffer, CmdListMode::Compute);
+      };
+
+      auto preparePersistentDispatchArgs = [&](const char* profileName)
+      {
+          ProfileBlock preparePB(cmdList, profileName);
+
+          if(dispatchArgsState != D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
+          {
+              wavefrontDispatchArgsBuffer.Transition(cmdList, dispatchArgsState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+              dispatchArgsState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+          }
+
+          cmdList->SetPipelineState(wavefrontPrepareDispatchArgsPSO);
+          DX12::CmdList->Dispatch(1, 1, 1);
+          wavefrontDispatchArgsBuffer.UAVBarrier(cmdList);
+          wavefrontDispatchArgsBuffer.Transition(cmdList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+          dispatchArgsState = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+      };
+
+      bindWavefrontConstants(0, 0, 1);
+      {
+          ProfileBlock clearPB(cmdList, "Persistent Clear");
+          cmdList->SetPipelineState(wavefrontClearPSO);
+          DX12::CmdList->Dispatch(1, 1, 1);
+          wavefrontCounterBuffer.UAVBarrier(cmdList);
+      }
+
+      {
+          ProfileBlock generatePB(cmdList, "Persistent Generate Primary");
+          cmdList->SetPipelineState(wavefrontGeneratePrimaryPSO);
+          DX12::CmdList->Dispatch(gx, gy, 1);
+          wavefrontPathStateBuffer.UAVBarrier(cmdList);
+          wavefrontRayQueueA.UAVBarrier(cmdList);
+          wavefrontCounterBuffer.UAVBarrier(cmdList);
+      }
+
+      uint32 currentQueue = 0;
+      for(uint32 bounce = 0; bounce < uint32(AppSettings::MaxPathLength); ++bounce)
+      {
+          const uint32 nextQueue = currentQueue ^ 1;
+          bindWavefrontConstants(bounce, currentQueue, nextQueue);
+
+          {
+              ProfileBlock preparePB(cmdList, PersistentPrepareProfileNames[bounce]);
+              cmdList->SetPipelineState(wavefrontPreparePersistentBouncePSO);
+              DX12::CmdList->Dispatch(1, 1, 1);
+              wavefrontCounterBuffer.UAVBarrier(cmdList);
+          }
+
+          {
+              ProfileBlock traceShadePB(cmdList, PersistentTraceShadeProfileNames[bounce]);
+              cmdList->SetPipelineState(wavefrontPersistentTraceShadePSO);
+              DX12::CmdList->Dispatch(persistentGroups, 1, 1);
+              wavefrontPathStateBuffer.UAVBarrier(cmdList);
+              wavefrontRayQueueA.UAVBarrier(cmdList);
+              wavefrontRayQueueB.UAVBarrier(cmdList);
+              wavefrontShadowQueue.UAVBarrier(cmdList);
+              wavefrontCounterBuffer.UAVBarrier(cmdList);
+          }
+
+          preparePersistentDispatchArgs(PersistentPrepareArgsProfileNames[bounce]);
+
+          {
+              ProfileBlock shadowPB(cmdList, PersistentTraceShadowProfileNames[bounce]);
+              cmdList->SetPipelineState(wavefrontTraceShadowsPSO);
+              cmdList->ExecuteIndirect(wavefrontDispatchCommandSignature, 1, wavefrontDispatchArgsBuffer.Resource(),
+                                       shadowDispatchArgsOffset, nullptr, 0);
+              wavefrontPathStateBuffer.UAVBarrier(cmdList);
+              wavefrontCounterBuffer.UAVBarrier(cmdList);
+          }
+
+          currentQueue = nextQueue;
+
+          {
+              ProfileBlock advancePB(cmdList, PersistentAdvanceProfileNames[bounce]);
+              cmdList->SetPipelineState(wavefrontAdvancePSO);
+              DX12::CmdList->Dispatch(1, 1, 1);
+              wavefrontCounterBuffer.UAVBarrier(cmdList);
+          }
+      }
+
+      bindWavefrontConstants(0, 0, 1);
+      {
+          ProfileBlock accumulatePB(cmdList, "Persistent Accumulate");
           cmdList->SetPipelineState(wavefrontAccumulatePSO);
           DX12::CmdList->Dispatch(gx, gy, 1);
           wavefrontPathStateBuffer.UAVBarrier(cmdList);

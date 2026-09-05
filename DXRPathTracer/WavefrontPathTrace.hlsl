@@ -139,12 +139,14 @@ static const uint Counter_Shadows = 2;
 static const uint Counter_Hits = 3;
 static const uint Counter_ReorderBinCounts = 4;
 static const uint Counter_ReorderBinOffsets = 68;
+static const uint Counter_WorkCursor = 132;
 
 static const uint PathFlag_Diffuse = 1u;
 static const uint QueueA = 0u;
 static const uint QueueB = 1u;
 static const uint RayTraceFlag_EnableWavefrontReorder = 2u;
 static const uint RayTraceFlag_EnableWavefrontBlockSort = 4u;
+static const uint RayTraceFlag_EnableWavefrontWaveAppend = 8u;
 static const uint NumReorderBins = 64u;
 static const uint DispatchArgs_CurrentRays = 0u;
 static const uint DispatchArgs_Hits = 1u;
@@ -202,6 +204,25 @@ static uint WavefrontHitSortKey(in HitWorkItem hitItem)
 {
     const uint key = hitItem.GeometryIdx | (hitItem.PrimitiveIdx << 16);
     return key & (NumReorderBins - 1);
+}
+
+static uint AllocateQueueIndex(in uint counterIdx, in bool appendItem)
+{
+    if((RayTraceCB.myFlags & RayTraceFlag_EnableWavefrontWaveAppend) == 0u)
+    {
+        uint itemIdx = 0;
+        if(appendItem)
+            InterlockedAdd(WavefrontCounters[counterIdx], 1u, itemIdx);
+        return itemIdx;
+    }
+
+    const uint waveAppendCount = WaveActiveCountBits(appendItem);
+    uint waveBaseIdx = 0;
+    if(WaveIsFirstLane() && waveAppendCount > 0u)
+        InterlockedAdd(WavefrontCounters[counterIdx], waveAppendCount, waveBaseIdx);
+
+    waveBaseIdx = WaveReadLaneFirst(waveBaseIdx);
+    return waveBaseIdx + WavePrefixCountBits(appendItem);
 }
 
 MeshVertex GetHitSurface_RQ(in float2 bary2, in uint geometryIdx, in uint primitiveIdx)
@@ -629,8 +650,7 @@ void WavefrontTraceHitsCS(uint3 dispatchThreadID : SV_DispatchThreadID)
     hitItem.RayDirection = ray.Direction;
     hitItem.Padding = 0;
 
-    uint hitIdx = 0;
-    InterlockedAdd(WavefrontCounters[Counter_Hits], 1, hitIdx);
+    const uint hitIdx = AllocateQueueIndex(Counter_Hits, true);
     StoreHitWorkItem(RayTraceCB.WavefrontReadQueue, hitIdx, hitItem);
 }
 
@@ -661,6 +681,95 @@ void WavefrontPrepareDispatchArgsCS(uint3 dispatchThreadID : SV_DispatchThreadID
     WavefrontDispatchArgs.Store(hitMetaOffset + 0u, hitMetaGroups);
     WavefrontDispatchArgs.Store(hitMetaOffset + 4u, 1u);
     WavefrontDispatchArgs.Store(hitMetaOffset + 8u, 1u);
+}
+
+static void ShadeHitWorkItem(in HitWorkItem hitItem)
+{
+    PathState state = PathStates[hitItem.PathStateIdx];
+
+    MeshVertex hitSurface = GetHitSurface_RQ(hitItem.Bary, hitItem.GeometryIdx, hitItem.PrimitiveIdx);
+    Material material = GetGeometryMaterial_RQ(hitItem.GeometryIdx);
+
+    float3 addRadiance;
+    float3 sunContribution;
+    ShadowWorkItem sunShadow;
+    NextBounce next;
+    bool shaded = ShadeSurfaceAndSampleNext(hitSurface, material, hitItem.RayOrigin, hitItem.RayDirection, state.PixelIdx,
+                                            state.SampleSetIdx, state.PathLength, (state.Flags & PathFlag_Diffuse) != 0,
+                                            state.Roughness, addRadiance, sunContribution, sunShadow, next);
+
+    if(shaded == false)
+    {
+        PathStates[hitItem.PathStateIdx] = state;
+        return;
+    }
+
+    state.Radiance += state.Throughput * addRadiance;
+
+    if(any(sunContribution != 0.0.xxx))
+    {
+        const uint shadowIdx = AllocateQueueIndex(Counter_Shadows, true);
+        sunShadow.Contribution = state.Throughput * sunContribution;
+        sunShadow.PathStateIdx = hitItem.PathStateIdx;
+        ShadowQueue[shadowIdx] = sunShadow;
+    }
+
+    if(next.Valid == false)
+    {
+        PathStates[hitItem.PathStateIdx] = state;
+        return;
+    }
+
+    const bool canContinue = AppSettings.EnableIndirect &&
+                             ((state.PathLength + 1) < AppSettings.MaxPathLength) &&
+                             (!AppSettings.EnableWhiteFurnaceMode);
+
+    if(canContinue == false)
+    {
+        RayDesc visRay;
+        visRay.Origin = hitSurface.Position;
+        visRay.Direction = next.DirWS;
+        visRay.TMin = 0.00001f;
+        visRay.TMax = FP32Max;
+
+        uint visFlags = RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH;
+        if((state.PathLength + 1) > AppSettings.MaxAnyHitPathLength)
+            visFlags |= RAY_FLAG_FORCE_OPAQUE;
+
+        if(AppSettings.EnableWhiteFurnaceMode)
+        {
+            state.Radiance += state.Throughput * next.Throughput;
+        }
+        else
+        {
+            const float visibility = TraceShadowInline(visRay, 0xFFFFFFFF, visFlags);
+            TextureCube skyTexture = ResourceDescriptorHeap[RayTraceCB.SkyTextureIdx];
+            float3 skyRadiance = AppSettings.EnableSky ? skyTexture.SampleLevel(LinearSampler, next.DirWS, 0.0f).xyz : 0.0.xxx;
+            state.Radiance += state.Throughput * visibility * skyRadiance * next.Throughput;
+        }
+
+        PathStates[hitItem.PathStateIdx] = state;
+        return;
+    }
+
+    state.Throughput *= next.Throughput;
+    state.PathLength += 1;
+    state.Roughness = next.Roughness;
+    state.Flags = next.IsDiffuse ? PathFlag_Diffuse : 0;
+
+    RayWorkItem nextRay;
+    nextRay.Origin = hitSurface.Position;
+    nextRay.TMin = 0.00001f;
+    nextRay.Direction = next.DirWS;
+    nextRay.TMax = FP32Max;
+    nextRay.PathStateIdx = hitItem.PathStateIdx;
+    nextRay.Padding0 = 0;
+    nextRay.Padding1 = 0;
+    nextRay.Padding2 = 0;
+
+    const uint nextIdx = AllocateQueueIndex(Counter_NextRays, true);
+    StoreRayWorkItem(RayTraceCB.WavefrontWriteQueue, nextIdx, nextRay);
+    PathStates[hitItem.PathStateIdx] = state;
 }
 
 [numthreads(64, 1, 1)]
@@ -722,96 +831,78 @@ void WavefrontShadeHitsCS(uint3 dispatchThreadID : SV_DispatchThreadID, uint gro
         hitItem = SharedBlockSortHits[groupIndex];
     }
 
-    if(validWork == false || hitItem.GeometryIdx == 0xFFFFFFFFu)
-        return;
-
-    PathState state = PathStates[hitItem.PathStateIdx];
-
-    MeshVertex hitSurface = GetHitSurface_RQ(hitItem.Bary, hitItem.GeometryIdx, hitItem.PrimitiveIdx);
-    Material material = GetGeometryMaterial_RQ(hitItem.GeometryIdx);
-
-    float3 addRadiance;
-    float3 sunContribution;
-    ShadowWorkItem sunShadow;
-    NextBounce next;
-    bool shaded = ShadeSurfaceAndSampleNext(hitSurface, material, hitItem.RayOrigin, hitItem.RayDirection, state.PixelIdx,
-                                            state.SampleSetIdx, state.PathLength, (state.Flags & PathFlag_Diffuse) != 0,
-                                            state.Roughness, addRadiance, sunContribution, sunShadow, next);
-
-    if(shaded == false)
+    if(((RayTraceCB.myFlags & RayTraceFlag_EnableWavefrontBlockSort) == 0u && validWork == false) ||
+       hitItem.GeometryIdx == 0xFFFFFFFFu)
     {
-        PathStates[hitItem.PathStateIdx] = state;
         return;
     }
 
-    state.Radiance += state.Throughput * addRadiance;
+    ShadeHitWorkItem(hitItem);
+}
 
-    if(any(sunContribution != 0.0.xxx))
+[numthreads(1, 1, 1)]
+void WavefrontPreparePersistentBounceCS(uint3 dispatchThreadID : SV_DispatchThreadID)
+{
+    WavefrontCounters[Counter_WorkCursor] = 0;
+}
+
+[numthreads(64, 1, 1)]
+void WavefrontPersistentTraceShadeCS(uint3 dispatchThreadID : SV_DispatchThreadID)
+{
+    while(true)
     {
-        uint shadowIdx = 0;
-        InterlockedAdd(WavefrontCounters[Counter_Shadows], 1, shadowIdx);
-        sunShadow.Contribution = state.Throughput * sunContribution;
-        sunShadow.PathStateIdx = hitItem.PathStateIdx;
-        ShadowQueue[shadowIdx] = sunShadow;
-    }
+        uint waveBaseIdx = 0;
+        const uint laneIdx = WaveGetLaneIndex();
+        const uint waveSize = WaveGetLaneCount();
 
-    if(next.Valid == false)
-    {
-        PathStates[hitItem.PathStateIdx] = state;
-        return;
-    }
+        if(WaveIsFirstLane())
+            InterlockedAdd(WavefrontCounters[Counter_WorkCursor], waveSize, waveBaseIdx);
 
-    const bool canContinue = AppSettings.EnableIndirect &&
-                             ((state.PathLength + 1) < AppSettings.MaxPathLength) &&
-                             (!AppSettings.EnableWhiteFurnaceMode);
+        waveBaseIdx = WaveReadLaneFirst(waveBaseIdx);
+        const uint workIdx = waveBaseIdx + laneIdx;
+        const bool validWork = workIdx < WavefrontCounters[Counter_CurrentRays];
 
-    if(canContinue == false)
-    {
-        RayDesc visRay;
-        visRay.Origin = hitSurface.Position;
-        visRay.Direction = next.DirWS;
-        visRay.TMin = 0.00001f;
-        visRay.TMax = FP32Max;
+        if(WaveActiveAnyTrue(validWork) == false)
+            break;
 
-        uint visFlags = RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH;
-        if((state.PathLength + 1) > AppSettings.MaxAnyHitPathLength)
-            visFlags |= RAY_FLAG_FORCE_OPAQUE;
-
-        if(AppSettings.EnableWhiteFurnaceMode)
+        if(validWork)
         {
-            state.Radiance += state.Throughput * next.Throughput;
-        }
-        else
-        {
-            const float visibility = TraceShadowInline(visRay, 0xFFFFFFFF, visFlags);
-            TextureCube skyTexture = ResourceDescriptorHeap[RayTraceCB.SkyTextureIdx];
-            float3 skyRadiance = AppSettings.EnableSky ? skyTexture.SampleLevel(LinearSampler, next.DirWS, 0.0f).xyz : 0.0.xxx;
-            state.Radiance += state.Throughput * visibility * skyRadiance * next.Throughput;
-        }
+            RayWorkItem rayItem = LoadRayWorkItem(RayTraceCB.WavefrontReadQueue, workIdx);
+            PathState state = PathStates[rayItem.PathStateIdx];
 
-        PathStates[hitItem.PathStateIdx] = state;
-        return;
+            RayDesc ray;
+            ray.Origin = rayItem.Origin;
+            ray.Direction = rayItem.Direction;
+            ray.TMin = rayItem.TMin;
+            ray.TMax = rayItem.TMax;
+
+            uint rayFlags = 0;
+            if(state.PathLength > AppSettings.MaxAnyHitPathLength)
+                rayFlags |= RAY_FLAG_FORCE_OPAQUE;
+
+            HitInfoRQ hit = TraceClosestHitInline_Radiance(ray, 0xFFFFFFFF, rayFlags);
+
+            if(hit.Hit == false)
+            {
+                state.Radiance += state.Throughput * EvaluateMissRadiance(ray.Direction, state.PathLength);
+                PathStates[rayItem.PathStateIdx] = state;
+            }
+            else
+            {
+                HitWorkItem hitItem;
+                hitItem.PathStateIdx = rayItem.PathStateIdx;
+                hitItem.GeometryIdx = hit.GeometryIdx;
+                hitItem.PrimitiveIdx = hit.PrimitiveIdx;
+                hitItem.Bary = hit.Bary;
+                hitItem.RayOrigin = ray.Origin;
+                hitItem.RayT = hit.T;
+                hitItem.RayDirection = ray.Direction;
+                hitItem.Padding = 0;
+
+                ShadeHitWorkItem(hitItem);
+            }
+        }
     }
-
-    state.Throughput *= next.Throughput;
-    state.PathLength += 1;
-    state.Roughness = next.Roughness;
-    state.Flags = next.IsDiffuse ? PathFlag_Diffuse : 0;
-
-    RayWorkItem nextRay;
-    nextRay.Origin = hitSurface.Position;
-    nextRay.TMin = 0.00001f;
-    nextRay.Direction = next.DirWS;
-    nextRay.TMax = FP32Max;
-    nextRay.PathStateIdx = hitItem.PathStateIdx;
-    nextRay.Padding0 = 0;
-    nextRay.Padding1 = 0;
-    nextRay.Padding2 = 0;
-
-    uint nextIdx = 0;
-    InterlockedAdd(WavefrontCounters[Counter_NextRays], 1, nextIdx);
-    StoreRayWorkItem(RayTraceCB.WavefrontWriteQueue, nextIdx, nextRay);
-    PathStates[hitItem.PathStateIdx] = state;
 }
 
 [numthreads(64, 1, 1)]
