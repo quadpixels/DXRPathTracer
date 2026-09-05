@@ -865,52 +865,105 @@ void WavefrontPersistentTraceShadeCS(uint3 dispatchThreadID : SV_DispatchThreadI
         uint waveBaseIdx = 0;
         const uint laneIdx = WaveGetLaneIndex();
         const uint waveSize = WaveGetLaneCount();
+        const uint batchWaves = max(RayTraceCB.WavefrontPadding, 1u);
+        const uint batchSize = waveSize * batchWaves;
 
         if(WaveIsFirstLane())
-            InterlockedAdd(WavefrontCounters[Counter_WorkCursor], waveSize, waveBaseIdx);
+            InterlockedAdd(WavefrontCounters[Counter_WorkCursor], batchSize, waveBaseIdx);
 
         waveBaseIdx = WaveReadLaneFirst(waveBaseIdx);
-        const uint workIdx = waveBaseIdx + laneIdx;
-        const bool validWork = workIdx < WavefrontCounters[Counter_CurrentRays];
+        const uint numCurrentRays = WavefrontCounters[Counter_CurrentRays];
+        const bool batchHasWork = waveBaseIdx < numCurrentRays;
 
-        if(WaveActiveAnyTrue(validWork) == false)
+        if(WaveActiveAnyTrue(batchHasWork) == false)
             break;
 
-        if(validWork)
+        for(uint batchWave = 0; batchWave < batchWaves; ++batchWave)
         {
-            RayWorkItem rayItem = LoadRayWorkItem(RayTraceCB.WavefrontReadQueue, workIdx);
-            PathState state = PathStates[rayItem.PathStateIdx];
+            const uint workIdx = waveBaseIdx + batchWave * waveSize + laneIdx;
+            const bool validWork = workIdx < numCurrentRays;
 
-            RayDesc ray;
-            ray.Origin = rayItem.Origin;
-            ray.Direction = rayItem.Direction;
-            ray.TMin = rayItem.TMin;
-            ray.TMax = rayItem.TMax;
-
-            uint rayFlags = 0;
-            if(state.PathLength > AppSettings.MaxAnyHitPathLength)
-                rayFlags |= RAY_FLAG_FORCE_OPAQUE;
-
-            HitInfoRQ hit = TraceClosestHitInline_Radiance(ray, 0xFFFFFFFF, rayFlags);
-
-            if(hit.Hit == false)
+            if(validWork)
             {
-                state.Radiance += state.Throughput * EvaluateMissRadiance(ray.Direction, state.PathLength);
-                PathStates[rayItem.PathStateIdx] = state;
+                RayWorkItem rayItem = LoadRayWorkItem(RayTraceCB.WavefrontReadQueue, workIdx);
+                PathState state = PathStates[rayItem.PathStateIdx];
+
+                RayDesc ray;
+                ray.Origin = rayItem.Origin;
+                ray.Direction = rayItem.Direction;
+                ray.TMin = rayItem.TMin;
+                ray.TMax = rayItem.TMax;
+
+                uint rayFlags = 0;
+                if(state.PathLength > AppSettings.MaxAnyHitPathLength)
+                    rayFlags |= RAY_FLAG_FORCE_OPAQUE;
+
+                HitInfoRQ hit = TraceClosestHitInline_Radiance(ray, 0xFFFFFFFF, rayFlags);
+
+                if(hit.Hit == false)
+                {
+                    state.Radiance += state.Throughput * EvaluateMissRadiance(ray.Direction, state.PathLength);
+                    PathStates[rayItem.PathStateIdx] = state;
+                }
+                else
+                {
+                    HitWorkItem hitItem;
+                    hitItem.PathStateIdx = rayItem.PathStateIdx;
+                    hitItem.GeometryIdx = hit.GeometryIdx;
+                    hitItem.PrimitiveIdx = hit.PrimitiveIdx;
+                    hitItem.Bary = hit.Bary;
+                    hitItem.RayOrigin = ray.Origin;
+                    hitItem.RayT = hit.T;
+                    hitItem.RayDirection = ray.Direction;
+                    hitItem.Padding = 0;
+
+                    ShadeHitWorkItem(hitItem);
+                }
             }
-            else
-            {
-                HitWorkItem hitItem;
-                hitItem.PathStateIdx = rayItem.PathStateIdx;
-                hitItem.GeometryIdx = hit.GeometryIdx;
-                hitItem.PrimitiveIdx = hit.PrimitiveIdx;
-                hitItem.Bary = hit.Bary;
-                hitItem.RayOrigin = ray.Origin;
-                hitItem.RayT = hit.T;
-                hitItem.RayDirection = ray.Direction;
-                hitItem.Padding = 0;
+        }
+    }
+}
 
-                ShadeHitWorkItem(hitItem);
+[numthreads(64, 1, 1)]
+void WavefrontPersistentTraceShadowsCS(uint3 dispatchThreadID : SV_DispatchThreadID)
+{
+    while(true)
+    {
+        uint waveBaseIdx = 0;
+        const uint laneIdx = WaveGetLaneIndex();
+        const uint waveSize = WaveGetLaneCount();
+        const uint batchWaves = max(RayTraceCB.WavefrontPadding, 1u);
+        const uint batchSize = waveSize * batchWaves;
+
+        if(WaveIsFirstLane())
+            InterlockedAdd(WavefrontCounters[Counter_WorkCursor], batchSize, waveBaseIdx);
+
+        waveBaseIdx = WaveReadLaneFirst(waveBaseIdx);
+        const uint numShadows = WavefrontCounters[Counter_Shadows];
+        const bool batchHasWork = waveBaseIdx < numShadows;
+
+        if(WaveActiveAnyTrue(batchHasWork) == false)
+            break;
+
+        for(uint batchWave = 0; batchWave < batchWaves; ++batchWave)
+        {
+            const uint workIdx = waveBaseIdx + batchWave * waveSize + laneIdx;
+            const bool validWork = workIdx < numShadows;
+
+            if(validWork)
+            {
+                ShadowWorkItem shadow = ShadowQueue[workIdx];
+                PathState state = PathStates[shadow.PathStateIdx];
+
+                RayDesc ray;
+                ray.Origin = shadow.Origin;
+                ray.Direction = shadow.Direction;
+                ray.TMin = shadow.TMin;
+                ray.TMax = shadow.TMax;
+
+                const float visibility = TraceShadowInline(ray, 0xFFFFFFFF, shadow.RayFlags);
+                state.Radiance += visibility * shadow.Contribution;
+                PathStates[shadow.PathStateIdx] = state;
             }
         }
     }

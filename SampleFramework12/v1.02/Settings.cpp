@@ -22,6 +22,9 @@ extern bool g_wavefront_reorder;
 extern bool g_wavefront_skip_primary_sort;
 extern bool g_wavefront_block_sort;
 extern bool g_wavefront_wave_append;
+extern bool g_persistent_shadow_workers;
+extern int g_persistent_worker_groups;
+extern int g_persistent_batch_waves;
 
 namespace SampleFramework12
 {
@@ -870,6 +873,9 @@ void SettingsContainer::Update(uint32 displayWidth, uint32 displayHeight, const 
     ImGui::Checkbox("Skip Primary Hit Sort", &g_wavefront_skip_primary_sort);
     ImGui::Checkbox("Thread Block Hit Sort", &g_wavefront_block_sort);
     ImGui::Checkbox("Wavefront Wave Append", &g_wavefront_wave_append);
+    ImGui::Checkbox("Persistent Shadow Workers", &g_persistent_shadow_workers);
+    ImGui::SliderInt("Persistent Worker Groups", &g_persistent_worker_groups, 64, 4096);
+    ImGui::SliderInt("Persistent Batch Waves", &g_persistent_batch_waves, 1, 8);
     ImGui::RadioButton("DXR1.0 (original)", &g_render_path, 0);
     ImGui::RadioButton("DXR1.0 (recursion, SER)", &g_render_path, 1);
     ImGui::RadioButton("DXR1.0 (loop, SER)", &g_render_path, 2);

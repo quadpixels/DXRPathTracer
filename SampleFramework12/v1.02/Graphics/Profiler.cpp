@@ -22,6 +22,9 @@ extern bool g_wavefront_reorder;
 extern bool g_wavefront_skip_primary_sort;
 extern bool g_wavefront_block_sort;
 extern bool g_wavefront_wave_append;
+extern bool g_persistent_shadow_workers;
+extern int g_persistent_worker_groups;
+extern int g_persistent_batch_waves;
 
 namespace SampleFramework12
 {
@@ -434,6 +437,11 @@ static string BuildWavefrontTimingSummary(const Array<ProfileData>& profiles, ui
 
         text += "\r\nPersistent GPU timing summary\r\n";
         text += "=============================\r\n";
+        char settingsLine[256] = { };
+        sprintf_s(settingsLine, "Persistent Settings: worker groups=%d, batch waves=%d, shadow=%s\r\n",
+                  g_persistent_worker_groups, g_persistent_batch_waves,
+                  g_persistent_shadow_workers ? "persistent workers" : "indirect dispatch");
+        text += settingsLine;
         AppendTimingLine(text, "RayQuery Persistent Workers", persistentTotal);
         AppendTimingLine(text, "Persistent Clear", ProfileTimeByName(profiles, numProfiles, "Persistent Clear"));
         AppendTimingLine(text, "Persistent Generate Primary", ProfileTimeByName(profiles, numProfiles, "Persistent Generate Primary"));
