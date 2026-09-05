@@ -148,6 +148,7 @@ static const uint NumReorderBins = 64u;
 static const uint DispatchArgs_CurrentRays = 0u;
 static const uint DispatchArgs_Hits = 1u;
 static const uint DispatchArgs_Shadows = 2u;
+static const uint DispatchArgs_HitMeta = 3u;
 static const uint DispatchArgsStrideBytes = 12u;
 
 static float2 SamplePoint(in uint pixelIdx, inout uint setIdx)
@@ -635,6 +636,7 @@ void WavefrontPrepareDispatchArgsCS(uint3 dispatchThreadID : SV_DispatchThreadID
     const uint currentRayGroups = (WavefrontCounters[Counter_CurrentRays] + 63u) / 64u;
     const uint hitGroups = (WavefrontCounters[Counter_Hits] + 63u) / 64u;
     const uint shadowGroups = (WavefrontCounters[Counter_Shadows] + 63u) / 64u;
+    const uint hitMetaGroups = WavefrontCounters[Counter_Hits] > 0u ? 1u : 0u;
 
     const uint currentRayOffset = DispatchArgs_CurrentRays * DispatchArgsStrideBytes;
     WavefrontDispatchArgs.Store(currentRayOffset + 0u, currentRayGroups);
@@ -650,6 +652,11 @@ void WavefrontPrepareDispatchArgsCS(uint3 dispatchThreadID : SV_DispatchThreadID
     WavefrontDispatchArgs.Store(shadowOffset + 0u, shadowGroups);
     WavefrontDispatchArgs.Store(shadowOffset + 4u, 1u);
     WavefrontDispatchArgs.Store(shadowOffset + 8u, 1u);
+
+    const uint hitMetaOffset = DispatchArgs_HitMeta * DispatchArgsStrideBytes;
+    WavefrontDispatchArgs.Store(hitMetaOffset + 0u, hitMetaGroups);
+    WavefrontDispatchArgs.Store(hitMetaOffset + 4u, 1u);
+    WavefrontDispatchArgs.Store(hitMetaOffset + 8u, 1u);
 }
 
 [numthreads(64, 1, 1)]

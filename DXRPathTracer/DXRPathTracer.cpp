@@ -740,7 +740,7 @@ void DXRPathTracer::CreateRenderTargets()
         wavefrontCounterBuffer.Initialize(sbInit);
 
         RawBufferInit rbInit;
-        rbInit.NumElements = 9;
+        rbInit.NumElements = 12;
         rbInit.CreateUAV = true;
         rbInit.InitialState = D3D12_RESOURCE_STATE_COMMON;
         rbInit.Name = L"Wavefront Dispatch Args";
@@ -1090,6 +1090,9 @@ void DXRPathTracer::CreateRayTracingRayQueryPSOs() {
 
     cpsd.CS = wavefrontTraceShadowsCS.ByteCode();
     DXCall(DX12::Device->CreateComputePipelineState(&cpsd, IID_PPV_ARGS(&wavefrontTraceShadowsPSO)));
+
+    cpsd.CS = wavefrontPrepareDispatchArgsCS.ByteCode();
+    DXCall(DX12::Device->CreateComputePipelineState(&cpsd, IID_PPV_ARGS(&wavefrontPrepareDispatchArgsPSO)));
 
     cpsd.CS = wavefrontClearReorderCS.ByteCode();
     DXCall(DX12::Device->CreateComputePipelineState(&cpsd, IID_PPV_ARGS(&wavefrontClearReorderPSO)));
@@ -1589,6 +1592,7 @@ void DXRPathTracer::RenderRayTracing()
         DX12::NullStructuredBufferUAV,
         DX12::NullStructuredBufferUAV,
         DX12::NullStructuredBufferUAV,
+        DX12::NullRawBufferUAV,
     };
     DX12::BindTempDescriptorTable(cmdList, defaultUAVs, ArraySize_(defaultUAVs), RTParams_UAVDescriptor, CmdListMode::Compute);
 
@@ -1743,6 +1747,30 @@ void DXRPathTracer::RenderRayTracing()
           "WF Hit Sort B7",
       };
 
+      static const char* PrepareAfterTraceProfileNames[] =
+      {
+          "WF Prepare Args After Trace B0",
+          "WF Prepare Args After Trace B1",
+          "WF Prepare Args After Trace B2",
+          "WF Prepare Args After Trace B3",
+          "WF Prepare Args After Trace B4",
+          "WF Prepare Args After Trace B5",
+          "WF Prepare Args After Trace B6",
+          "WF Prepare Args After Trace B7",
+      };
+
+      static const char* PrepareAfterShadeProfileNames[] =
+      {
+          "WF Prepare Args After Shade B0",
+          "WF Prepare Args After Shade B1",
+          "WF Prepare Args After Shade B2",
+          "WF Prepare Args After Shade B3",
+          "WF Prepare Args After Shade B4",
+          "WF Prepare Args After Shade B5",
+          "WF Prepare Args After Shade B6",
+          "WF Prepare Args After Shade B7",
+      };
+
       static const char* ShadeHitProfileNames[] =
       {
           "WF Shade Hits B0",
@@ -1789,15 +1817,20 @@ void DXRPathTracer::RenderRayTracing()
           wavefrontCounterBuffer.UAV,
           wavefrontHitQueueA.UAV,
           wavefrontHitQueueB.UAV,
+          wavefrontDispatchArgsBuffer.UAV,
       };
       DX12::BindTempDescriptorTable(cmdList, uavs, ArraySize_(uavs), RTParams_UAVDescriptor, CmdListMode::Compute);
 
       const uint32 width = uint32(rtTarget.Width());
       const uint32 height = uint32(rtTarget.Height());
-      const uint32 numPixels = width * height;
-      const uint32 pixelGroups = (numPixels + 63) / 64;
       const uint32 gx = (width + 7) / 8;
       const uint32 gy = (height + 7) / 8;
+      const uint64 dispatchArgsStride = sizeof(D3D12_DISPATCH_ARGUMENTS);
+      const uint64 currentRayDispatchArgsOffset = 0 * dispatchArgsStride;
+      const uint64 hitDispatchArgsOffset = 1 * dispatchArgsStride;
+      const uint64 shadowDispatchArgsOffset = 2 * dispatchArgsStride;
+      const uint64 hitMetaDispatchArgsOffset = 3 * dispatchArgsStride;
+      D3D12_RESOURCE_STATES dispatchArgsState = D3D12_RESOURCE_STATE_COMMON;
 
       auto bindWavefrontConstants = [&](uint32 bounce, uint32 readQueue, uint32 writeQueue)
       {
@@ -1805,6 +1838,23 @@ void DXRPathTracer::RenderRayTracing()
           rtConstants.WavefrontReadQueue = readQueue;
           rtConstants.WavefrontWriteQueue = writeQueue;
           DX12::BindTempConstantBuffer(cmdList, rtConstants, RTParams_CBuffer, CmdListMode::Compute);
+      };
+
+      auto prepareWavefrontDispatchArgs = [&](const char* profileName)
+      {
+          ProfileBlock preparePB(cmdList, profileName);
+
+          if(dispatchArgsState != D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
+          {
+              wavefrontDispatchArgsBuffer.Transition(cmdList, dispatchArgsState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+              dispatchArgsState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+          }
+
+          cmdList->SetPipelineState(wavefrontPrepareDispatchArgsPSO);
+          DX12::CmdList->Dispatch(1, 1, 1);
+          wavefrontDispatchArgsBuffer.UAVBarrier(cmdList);
+          wavefrontDispatchArgsBuffer.Transition(cmdList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+          dispatchArgsState = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
       };
 
       bindWavefrontConstants(0, 0, 1);
@@ -1823,6 +1873,7 @@ void DXRPathTracer::RenderRayTracing()
           wavefrontRayQueueA.UAVBarrier(cmdList);
           wavefrontCounterBuffer.UAVBarrier(cmdList);
       }
+      prepareWavefrontDispatchArgs("WF Prepare Args Initial");
 
       uint32 currentQueue = 0;
       for(uint32 bounce = 0; bounce < uint32(AppSettings::MaxPathLength); ++bounce)
@@ -1833,7 +1884,8 @@ void DXRPathTracer::RenderRayTracing()
           {
               ProfileBlock tracePB(cmdList, TraceHitProfileNames[bounce]);
               cmdList->SetPipelineState(wavefrontTraceHitsPSO);
-              DX12::CmdList->Dispatch(pixelGroups, 1, 1);
+              cmdList->ExecuteIndirect(wavefrontDispatchCommandSignature, 1, wavefrontDispatchArgsBuffer.Resource(),
+                                       currentRayDispatchArgsOffset, nullptr, 0);
               wavefrontPathStateBuffer.UAVBarrier(cmdList);
               wavefrontRayQueueA.UAVBarrier(cmdList);
               wavefrontRayQueueB.UAVBarrier(cmdList);
@@ -1841,6 +1893,7 @@ void DXRPathTracer::RenderRayTracing()
               wavefrontHitQueueB.UAVBarrier(cmdList);
               wavefrontCounterBuffer.UAVBarrier(cmdList);
           }
+          prepareWavefrontDispatchArgs(PrepareAfterTraceProfileNames[bounce]);
 
           uint32 hitReadQueue = currentQueue;
           if(g_wavefront_reorder)
@@ -1851,19 +1904,23 @@ void DXRPathTracer::RenderRayTracing()
               {
                   ProfileBlock sortPB(cmdList, HitSortProfileNames[bounce]);
                   cmdList->SetPipelineState(wavefrontClearReorderPSO);
-                  DX12::CmdList->Dispatch(1, 1, 1);
+                  cmdList->ExecuteIndirect(wavefrontDispatchCommandSignature, 1, wavefrontDispatchArgsBuffer.Resource(),
+                                           hitMetaDispatchArgsOffset, nullptr, 0);
                   wavefrontCounterBuffer.UAVBarrier(cmdList);
 
                   cmdList->SetPipelineState(wavefrontCountReorderBinsPSO);
-                  DX12::CmdList->Dispatch(pixelGroups, 1, 1);
+                  cmdList->ExecuteIndirect(wavefrontDispatchCommandSignature, 1, wavefrontDispatchArgsBuffer.Resource(),
+                                           hitDispatchArgsOffset, nullptr, 0);
                   wavefrontCounterBuffer.UAVBarrier(cmdList);
 
                   cmdList->SetPipelineState(wavefrontPrefixReorderBinsPSO);
-                  DX12::CmdList->Dispatch(1, 1, 1);
+                  cmdList->ExecuteIndirect(wavefrontDispatchCommandSignature, 1, wavefrontDispatchArgsBuffer.Resource(),
+                                           hitMetaDispatchArgsOffset, nullptr, 0);
                   wavefrontCounterBuffer.UAVBarrier(cmdList);
 
                   cmdList->SetPipelineState(wavefrontScatterReorderedRaysPSO);
-                  DX12::CmdList->Dispatch(pixelGroups, 1, 1);
+                  cmdList->ExecuteIndirect(wavefrontDispatchCommandSignature, 1, wavefrontDispatchArgsBuffer.Resource(),
+                                           hitDispatchArgsOffset, nullptr, 0);
                   wavefrontHitQueueA.UAVBarrier(cmdList);
                   wavefrontHitQueueB.UAVBarrier(cmdList);
                   wavefrontCounterBuffer.UAVBarrier(cmdList);
@@ -1876,18 +1933,21 @@ void DXRPathTracer::RenderRayTracing()
           {
               ProfileBlock shadePB(cmdList, ShadeHitProfileNames[bounce]);
               cmdList->SetPipelineState(wavefrontShadeHitsPSO);
-              DX12::CmdList->Dispatch(pixelGroups, 1, 1);
+              cmdList->ExecuteIndirect(wavefrontDispatchCommandSignature, 1, wavefrontDispatchArgsBuffer.Resource(),
+                                       hitDispatchArgsOffset, nullptr, 0);
               wavefrontPathStateBuffer.UAVBarrier(cmdList);
               wavefrontRayQueueA.UAVBarrier(cmdList);
               wavefrontRayQueueB.UAVBarrier(cmdList);
               wavefrontShadowQueue.UAVBarrier(cmdList);
               wavefrontCounterBuffer.UAVBarrier(cmdList);
           }
+          prepareWavefrontDispatchArgs(PrepareAfterShadeProfileNames[bounce]);
 
           {
               ProfileBlock shadowPB(cmdList, TraceShadowProfileNames[bounce]);
               cmdList->SetPipelineState(wavefrontTraceShadowsPSO);
-              DX12::CmdList->Dispatch(pixelGroups, 1, 1);
+              cmdList->ExecuteIndirect(wavefrontDispatchCommandSignature, 1, wavefrontDispatchArgsBuffer.Resource(),
+                                       shadowDispatchArgsOffset, nullptr, 0);
               wavefrontPathStateBuffer.UAVBarrier(cmdList);
               wavefrontCounterBuffer.UAVBarrier(cmdList);
           }
