@@ -883,7 +883,8 @@ void SettingsContainer::Update(uint32 displayWidth, uint32 displayHeight, const 
     ImGui::RadioButton("DXR1.1 (template recursion)", &g_render_path, 4);
     ImGui::RadioButton("DXR1.1 (loop-based)", &g_render_path, 5);
     ImGui::RadioButton("DXR1.1 (wavefront queues)", &g_render_path, 6);
-    ImGui::RadioButton("DXR1.1 (persistent workers)", &g_render_path, 7);
+    ImGui::RadioButton("DXR1.1 (Persistent Wavefront)", &g_render_path, 7);
+    ImGui::RadioButton("DXR1.1 (Persistent Warps)", &g_render_path, 8);
 
     for(uint64 groupIdx = 0; groupIdx < groups.Count(); ++groupIdx)
     {

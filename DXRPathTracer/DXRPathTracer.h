@@ -112,6 +112,7 @@ protected:
     CompiledShaderPtr wavefrontPreparePersistentBounceCS;
     CompiledShaderPtr wavefrontPersistentTraceShadeCS;
     CompiledShaderPtr wavefrontPersistentTraceShadowsCS;
+    CompiledShaderPtr persistentWarpsPathTraceCS;
     CompiledShaderPtr wavefrontClearReorderCS;
     CompiledShaderPtr wavefrontCountReorderBinsCS;
     CompiledShaderPtr wavefrontPrefixReorderBinsCS;
@@ -127,6 +128,7 @@ protected:
     ID3D12PipelineState* wavefrontPreparePersistentBouncePSO = nullptr;
     ID3D12PipelineState* wavefrontPersistentTraceShadePSO = nullptr;
     ID3D12PipelineState* wavefrontPersistentTraceShadowsPSO = nullptr;
+    ID3D12PipelineState* persistentWarpsPathTracePSO = nullptr;
     ID3D12PipelineState* wavefrontClearReorderPSO = nullptr;
     ID3D12PipelineState* wavefrontCountReorderBinsPSO = nullptr;
     ID3D12PipelineState* wavefrontPrefixReorderBinsPSO = nullptr;

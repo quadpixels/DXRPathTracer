@@ -969,6 +969,170 @@ void WavefrontPersistentTraceShadowsCS(uint3 dispatchThreadID : SV_DispatchThrea
     }
 }
 
+static void TraceFullPathForPixel(in uint pixelIdx, in uint2 pixelCoord, in uint width, in uint height)
+{
+    uint sampleSetIdx = 0;
+
+    float2 primaryRaySample = SamplePoint(pixelIdx, sampleSetIdx);
+
+    float2 rayPixelPos = pixelCoord + primaryRaySample;
+    float2 ncdXY = (rayPixelPos / (float2(width, height) * 0.5f)) - 1.0f;
+    ncdXY.y *= -1.0f;
+
+    float4 rayStart = mul(float4(ncdXY, 0.0f, 1.0f), RayTraceCB.InvViewProjection);
+    float4 rayEnd = mul(float4(ncdXY, 1.0f, 1.0f), RayTraceCB.InvViewProjection);
+
+    rayStart.xyz /= rayStart.w;
+    rayEnd.xyz /= rayEnd.w;
+
+    RayDesc ray;
+    ray.Origin = rayStart.xyz;
+    ray.Direction = normalize(rayEnd.xyz - rayStart.xyz);
+    ray.TMin = 0.0f;
+    ray.TMax = length(rayEnd.xyz - rayStart.xyz);
+
+    float3 radiance = 0.0.xxx;
+    float3 throughput = 1.0.xxx;
+    uint pathLength = 1;
+    uint pathFlags = 0;
+    float clampRoughnessValue = 0.0f;
+
+    while(true)
+    {
+        uint rayFlags = 0;
+        if(pathLength > AppSettings.MaxAnyHitPathLength)
+            rayFlags |= RAY_FLAG_FORCE_OPAQUE;
+
+        HitInfoRQ hit = TraceClosestHitInline_Radiance(ray, 0xFFFFFFFF, rayFlags);
+
+        if(hit.Hit == false)
+        {
+            radiance += throughput * EvaluateMissRadiance(ray.Direction, pathLength);
+            break;
+        }
+
+        MeshVertex hitSurface = GetHitSurface_RQ(hit.Bary, hit.GeometryIdx, hit.PrimitiveIdx);
+        Material material = GetGeometryMaterial_RQ(hit.GeometryIdx);
+
+        float3 addRadiance;
+        float3 sunContribution;
+        ShadowWorkItem sunShadow;
+        NextBounce next;
+        const bool shaded = ShadeSurfaceAndSampleNext(hitSurface, material, ray.Origin, ray.Direction, pixelIdx,
+                                                      sampleSetIdx, pathLength, (pathFlags & PathFlag_Diffuse) != 0,
+                                                      clampRoughnessValue, addRadiance, sunContribution, sunShadow, next);
+
+        if(shaded == false)
+            break;
+
+        radiance += throughput * addRadiance;
+
+        if(any(sunContribution != 0.0.xxx))
+        {
+            RayDesc shadowRay;
+            shadowRay.Origin = sunShadow.Origin;
+            shadowRay.Direction = sunShadow.Direction;
+            shadowRay.TMin = sunShadow.TMin;
+            shadowRay.TMax = sunShadow.TMax;
+
+            const float visibility = TraceShadowInline(shadowRay, 0xFFFFFFFF, sunShadow.RayFlags);
+            radiance += throughput * visibility * sunContribution;
+        }
+
+        if(next.Valid == false)
+            break;
+
+        const bool canContinue = AppSettings.EnableIndirect &&
+                                 ((pathLength + 1) < AppSettings.MaxPathLength) &&
+                                 (!AppSettings.EnableWhiteFurnaceMode);
+
+        if(canContinue == false)
+        {
+            RayDesc visRay;
+            visRay.Origin = hitSurface.Position;
+            visRay.Direction = next.DirWS;
+            visRay.TMin = 0.00001f;
+            visRay.TMax = FP32Max;
+
+            uint visFlags = RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH;
+            if((pathLength + 1) > AppSettings.MaxAnyHitPathLength)
+                visFlags |= RAY_FLAG_FORCE_OPAQUE;
+
+            if(AppSettings.EnableWhiteFurnaceMode)
+            {
+                radiance += throughput * next.Throughput;
+            }
+            else
+            {
+                const float visibility = TraceShadowInline(visRay, 0xFFFFFFFF, visFlags);
+                TextureCube skyTexture = ResourceDescriptorHeap[RayTraceCB.SkyTextureIdx];
+                float3 skyRadiance = AppSettings.EnableSky ? skyTexture.SampleLevel(LinearSampler, next.DirWS, 0.0f).xyz : 0.0.xxx;
+                radiance += throughput * visibility * skyRadiance * next.Throughput;
+            }
+
+            break;
+        }
+
+        throughput *= next.Throughput;
+        pathLength += 1;
+        clampRoughnessValue = next.Roughness;
+        pathFlags = next.IsDiffuse ? PathFlag_Diffuse : 0;
+
+        ray.Origin = hitSurface.Position;
+        ray.Direction = next.DirWS;
+        ray.TMin = 0.00001f;
+        ray.TMax = FP32Max;
+    }
+
+    float3 newSample = clamp(radiance, 0.0f, FP16Max);
+    const float lerpFactor = RayTraceCB.CurrSampleIdx / (RayTraceCB.CurrSampleIdx + 1.0f);
+    float3 currValue = RenderTarget[pixelCoord].xyz;
+    float3 newValue = lerp(newSample, currValue, lerpFactor);
+
+    if(RayTraceCB.CurrSampleIdx == 0)
+        newValue = newSample;
+
+    RenderTarget[pixelCoord] = float4(newValue, 1.0f);
+}
+
+[numthreads(64, 1, 1)]
+void PersistentWarpsPathTraceCS(uint3 dispatchThreadID : SV_DispatchThreadID)
+{
+    int width;
+    int height;
+    RenderTarget.GetDimensions(width, height);
+
+    while(true)
+    {
+        uint waveBaseIdx = 0;
+        const uint laneIdx = WaveGetLaneIndex();
+        const uint waveSize = WaveGetLaneCount();
+        const uint batchWaves = max(RayTraceCB.WavefrontPadding, 1u);
+        const uint batchSize = waveSize * batchWaves;
+
+        if(WaveIsFirstLane())
+            InterlockedAdd(WavefrontCounters[Counter_WorkCursor], batchSize, waveBaseIdx);
+
+        waveBaseIdx = WaveReadLaneFirst(waveBaseIdx);
+        const bool batchHasWork = waveBaseIdx < RayTraceCB.TotalNumPixels;
+
+        if(WaveActiveAnyTrue(batchHasWork) == false)
+            break;
+
+        for(uint batchWave = 0; batchWave < batchWaves; ++batchWave)
+        {
+            const uint pixelIdx = waveBaseIdx + batchWave * waveSize + laneIdx;
+            const bool validWork = pixelIdx < RayTraceCB.TotalNumPixels;
+
+            if(validWork)
+            {
+                const uint2 pixelCoord = uint2(pixelIdx % uint(width), pixelIdx / uint(width));
+                TraceFullPathForPixel(pixelIdx, pixelCoord, uint(width), uint(height));
+            }
+        }
+    }
+}
+
 [numthreads(64, 1, 1)]
 void WavefrontClearReorderCS(uint3 dispatchThreadID : SV_DispatchThreadID)
 {

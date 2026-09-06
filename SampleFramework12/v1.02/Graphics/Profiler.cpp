@@ -33,7 +33,7 @@ namespace SampleFramework12
 
 Profiler Profiler::GlobalProfiler;
 
-static const uint64 MaxProfiles = 128;
+static const uint64 MaxProfiles = 256;
 
 struct ProfileData
 {
@@ -417,7 +417,7 @@ static string BuildWavefrontTimingSummary(const Array<ProfileData>& profiles, ui
         AppendTimingLine(text, label, ProfileTimeByName(profiles, numProfiles, TraceShadowProfileNames[bounce]));
     }
 
-    const double persistentTotal = ProfileTimeByName(profiles, numProfiles, "RayQuery Persistent Workers Dispatch");
+    const double persistentTotal = ProfileTimeByName(profiles, numProfiles, "RayQuery Persistent Wavefront Dispatch");
     if(persistentTotal > 0.0)
     {
         double persistentPrepareTotal = 0.0;
@@ -435,23 +435,23 @@ static string BuildWavefrontTimingSummary(const Array<ProfileData>& profiles, ui
             persistentAdvanceTotal += ProfileTimeByName(profiles, numProfiles, PersistentAdvanceProfileNames[bounce]);
         }
 
-        text += "\r\nPersistent GPU timing summary\r\n";
-        text += "=============================\r\n";
+        text += "\r\nPersistent Wavefront GPU timing summary\r\n";
+        text += "=======================================\r\n";
         char settingsLine[256] = { };
-        sprintf_s(settingsLine, "Persistent Settings: worker groups=%d, batch waves=%d, shadow=%s\r\n",
+        sprintf_s(settingsLine, "Persistent Wavefront Settings: worker groups=%d, batch waves=%d, shadow=%s\r\n",
                   g_persistent_worker_groups, g_persistent_batch_waves,
-                  g_persistent_shadow_workers ? "persistent workers" : "indirect dispatch");
+                  g_persistent_shadow_workers ? "persistent shadow workers" : "indirect dispatch");
         text += settingsLine;
-        AppendTimingLine(text, "RayQuery Persistent Workers", persistentTotal);
-        AppendTimingLine(text, "Persistent Clear", ProfileTimeByName(profiles, numProfiles, "Persistent Clear"));
-        AppendTimingLine(text, "Persistent Generate Primary", ProfileTimeByName(profiles, numProfiles, "Persistent Generate Primary"));
-        AppendTimingLine(text, "Persistent Prepare Total", persistentPrepareTotal);
-        AppendTimingLine(text, "Persistent Trace+Shade Total", persistentTraceShadeTotal);
-        AppendTimingLine(text, "Persistent Prepare Args Total", persistentPrepareArgsTotal);
-        AppendTimingLine(text, "Persistent Trace Shadows Total", persistentShadowTotal);
-        AppendTimingLine(text, "Persistent Advance Total", persistentAdvanceTotal);
-        AppendTimingLine(text, "Persistent Accumulate", ProfileTimeByName(profiles, numProfiles, "Persistent Accumulate"));
-        text += "\r\nPersistent per-bounce detail\r\n";
+        AppendTimingLine(text, "RayQuery Persistent Wavefront", persistentTotal);
+        AppendTimingLine(text, "Persistent Wavefront Clear", ProfileTimeByName(profiles, numProfiles, "Persistent Clear"));
+        AppendTimingLine(text, "Persistent Wavefront Generate Primary", ProfileTimeByName(profiles, numProfiles, "Persistent Generate Primary"));
+        AppendTimingLine(text, "Persistent Wavefront Prepare Total", persistentPrepareTotal);
+        AppendTimingLine(text, "Persistent Wavefront Trace+Shade Total", persistentTraceShadeTotal);
+        AppendTimingLine(text, "Persistent Wavefront Prepare Args Total", persistentPrepareArgsTotal);
+        AppendTimingLine(text, "Persistent Wavefront Trace Shadows Total", persistentShadowTotal);
+        AppendTimingLine(text, "Persistent Wavefront Advance Total", persistentAdvanceTotal);
+        AppendTimingLine(text, "Persistent Wavefront Accumulate", ProfileTimeByName(profiles, numProfiles, "Persistent Accumulate"));
+        text += "\r\nPersistent Wavefront per-bounce detail\r\n";
 
         for(uint64 bounce = 0; bounce < ArraySize_(PersistentTraceShadeProfileNames); ++bounce)
         {
@@ -462,6 +462,21 @@ static string BuildWavefrontTimingSummary(const Array<ProfileData>& profiles, ui
             sprintf_s(label, "B%llu Persistent Shadows", bounce);
             AppendTimingLine(text, label, ProfileTimeByName(profiles, numProfiles, PersistentTraceShadowProfileNames[bounce]));
         }
+    }
+
+    const double persistentWarpsTotal = ProfileTimeByName(profiles, numProfiles, "RayQuery Persistent Warps Dispatch");
+    if(persistentWarpsTotal > 0.0)
+    {
+        text += "\r\nPersistent Warps GPU timing summary\r\n";
+        text += "===================================\r\n";
+        char settingsLine[256] = { };
+        sprintf_s(settingsLine, "Persistent Warps Settings: worker groups=%d, batch waves=%d\r\n",
+                  g_persistent_worker_groups, g_persistent_batch_waves);
+        text += settingsLine;
+        AppendTimingLine(text, "RayQuery Persistent Warps", persistentWarpsTotal);
+        AppendTimingLine(text, "Persistent Warps Clear", ProfileTimeByName(profiles, numProfiles, "Persistent Warps Clear"));
+        AppendTimingLine(text, "Persistent Warps Prepare", ProfileTimeByName(profiles, numProfiles, "Persistent Warps Prepare"));
+        AppendTimingLine(text, "Persistent Warps Path Trace", ProfileTimeByName(profiles, numProfiles, "Persistent Warps Path Trace"));
     }
 
     return text;
