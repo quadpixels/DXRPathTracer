@@ -755,8 +755,22 @@ void Profiler::EndFrame(uint32 displayWidth, uint32 displayHeight)
             if(ThreadGroupScan.Finished)
             {
                 ImGui::SameLine();
-                ImGui::Text("scan complete; results copied to clipboard");
+                ImGui::Text("scan complete");
             }
+        }
+
+        if(ThreadGroupScan.Results.empty() == false)
+        {
+            ImGui::Text("Thread Group Scan Results");
+            ImGui::SameLine();
+            if(ImGui::Button("Copy Scan Results"))
+                ImGui::SetClipboardText(ThreadGroupScan.Results.c_str());
+
+            ImGui::InputTextMultiline("##ThreadGroupScanResults",
+                                      const_cast<char*>(ThreadGroupScan.Results.c_str()),
+                                      ThreadGroupScan.Results.size() + 1,
+                                      ImVec2(-1.0f, ImGui::GetTextLineHeight() * 12.0f),
+                                      ImGuiInputTextFlags_ReadOnly);
         }
     }
     else
