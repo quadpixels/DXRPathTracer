@@ -215,6 +215,16 @@ static uint WavefrontHitSortKey(in HitWorkItem hitItem)
     return key & (NumReorderBins - 1);
 }
 
+static uint ActiveWaveLaneCount()
+{
+    return max(WaveActiveCountBits(true), 1u);
+}
+
+static uint ActiveWaveLaneIndex()
+{
+    return WavePrefixCountBits(true);
+}
+
 static uint AllocateQueueIndex(in uint counterIdx, in bool appendItem)
 {
     if((RayTraceCB.myFlags & RayTraceFlag_EnableWavefrontWaveAppend) == 0u)
@@ -811,7 +821,8 @@ void WavefrontShadeHitsCS(uint3 dispatchThreadID : SV_DispatchThreadID, uint gro
         hitItem.Padding = 0;
     }
 
-    if((RayTraceCB.myFlags & RayTraceFlag_EnableWavefrontBlockSort) != 0u)
+    const bool blockSortSupported = (WAVEFRONT_THREAD_GROUP_SIZE & (WAVEFRONT_THREAD_GROUP_SIZE - 1u)) == 0u;
+    if((RayTraceCB.myFlags & RayTraceFlag_EnableWavefrontBlockSort) != 0u && blockSortSupported)
     {
         SharedBlockSortHits[groupIndex] = hitItem;
         SharedBlockSortKeys[groupIndex] = validWork ? WavefrontHitSortKey(hitItem) : 0xFFFFFFFFu;
@@ -869,8 +880,8 @@ void WavefrontPersistentTraceShadeCS(uint3 dispatchThreadID : SV_DispatchThreadI
     while(true)
     {
         uint waveBaseIdx = 0;
-        const uint laneIdx = WaveGetLaneIndex();
-        const uint waveSize = WaveGetLaneCount();
+        const uint laneIdx = ActiveWaveLaneIndex();
+        const uint waveSize = ActiveWaveLaneCount();
         const uint batchWaves = max(RayTraceCB.WavefrontPadding, 1u);
         const uint batchSize = waveSize * batchWaves;
 
@@ -936,8 +947,8 @@ void WavefrontPersistentTraceShadowsCS(uint3 dispatchThreadID : SV_DispatchThrea
     while(true)
     {
         uint waveBaseIdx = 0;
-        const uint laneIdx = WaveGetLaneIndex();
-        const uint waveSize = WaveGetLaneCount();
+        const uint laneIdx = ActiveWaveLaneIndex();
+        const uint waveSize = ActiveWaveLaneCount();
         const uint batchWaves = max(RayTraceCB.WavefrontPadding, 1u);
         const uint batchSize = waveSize * batchWaves;
 
@@ -1111,8 +1122,8 @@ void PersistentWarpsPathTraceCS(uint3 dispatchThreadID : SV_DispatchThreadID)
     while(true)
     {
         uint waveBaseIdx = 0;
-        const uint laneIdx = WaveGetLaneIndex();
-        const uint waveSize = WaveGetLaneCount();
+        const uint laneIdx = ActiveWaveLaneIndex();
+        const uint waveSize = ActiveWaveLaneCount();
         const uint batchWaves = max(RayTraceCB.WavefrontPadding, 1u);
         const uint batchSize = waveSize * batchWaves;
 
