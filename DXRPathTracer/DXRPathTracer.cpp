@@ -68,7 +68,7 @@ StaticAssert_(ArraySize_(SceneSunDirections) == uint64(Scenes::NumValues));
 int g_render_path = 0;  // 0=DXR1.0 original, 1=DXR1.0 SER, 2=DXR1.0 loop SER, 3=DXR1.0 loop my, 4=DXR1.1 recursion, 5=DXR1.1 loop, 6=DXR1.1 wavefront, 7=DXR1.1 persistent wavefront, 8=DXR1.1 persistent warps
 int g_wavefront_thread_group_size = 64;
 
-static const uint32 WavefrontThreadGroupSizeVariants[] = { 16, 32, 64, 128, 256, 512 };
+static const uint32 WavefrontThreadGroupSizeVariants[] = { 16, 24, 32, 48, 64, 128, 256, 512 };
 
 static uint32 WavefrontThreadGroupVariantIndex()
 {
@@ -78,7 +78,7 @@ static uint32 WavefrontThreadGroupVariantIndex()
             return i;
     }
 
-    return 2;
+    return 4;
 }
 
 static uint32 ActiveWavefrontThreadGroupSize()

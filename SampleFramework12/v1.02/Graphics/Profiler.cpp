@@ -13,6 +13,7 @@
 #include "..\\Utility.h"
 #include "..\\ImGui\ImGui.h"
 #include <string>
+#include <chrono>
 
 using std::wstring;
 using std::map;
@@ -272,11 +273,183 @@ static double ProfileTimeByName(const Array<ProfileData>& profiles, uint64 numPr
     return 0.0;
 }
 
+static double CurrentFrameProfileTimeByName(const Array<ProfileData>& profiles, uint64 numProfiles,
+                                            const uint64* frameQueryData, uint64 gpuFrequency, const char* name)
+{
+    if(frameQueryData == nullptr || gpuFrequency == 0)
+        return 0.0;
+
+    for(uint64 i = 0; i < numProfiles; ++i)
+    {
+        if(profiles[i].Name == nullptr || strcmp(profiles[i].Name, name) != 0 || profiles[i].Active == false)
+            continue;
+
+        const uint64 startTime = frameQueryData[i * 2 + 0];
+        const uint64 endTime = frameQueryData[i * 2 + 1];
+        if(endTime <= startTime)
+            return 0.0;
+
+        const uint64 delta = endTime - startTime;
+        return (double(delta) / double(gpuFrequency)) * 1000.0;
+    }
+
+    return 0.0;
+}
+
 static void AppendTimingLine(string& text, const char* label, double time)
 {
     char line[256] = { };
     sprintf_s(line, "%-32s %.3f ms\r\n", label, time);
     text += line;
+}
+
+struct ThreadGroupScanState
+{
+    bool Active = false;
+    bool Finished = false;
+    uint32 ThreadGroupIdx = 0;
+    uint32 WorkerGroupIdx = 0;
+    uint32 WarmupFrames = 0;
+    uint32 SampleFrames = 0;
+    double SampleSum = 0.0;
+    int SavedThreadGroupSize = 64;
+    int SavedWorkerGroups = 1024;
+    double WarmupStartTime = 0;
+    double WarmupElapsedTime = 0;
+    string Results;
+};
+
+static ThreadGroupScanState ThreadGroupScan;
+static const int ThreadGroupScanThreadGroups[] = { 16, 24, 32, 48, 64, 128, 256, 512 };
+static const int ThreadGroupScanWorkerGroups[] = { 16, 32, 64, 128, 256, 512 };
+static const uint32 ThreadGroupScanWarmupFrames = 50;
+static const float  ThreadGroupScanWarmupSeconds = 5;  // Whichever comes first
+static const uint32 ThreadGroupScanSampleFrames = 20;
+
+static double CurrentSecondsSinceEpoch() {
+  auto now = std::chrono::system_clock::now();
+  // Get duration since epoch in milliseconds
+  auto duration = now.time_since_epoch();
+  double secs = std::chrono::duration_cast<std::chrono::milliseconds>(duration).count() / 1000.0;
+  return secs;
+}
+
+static void ApplyThreadGroupScanConfig()
+{
+    g_wavefront_thread_group_size = ThreadGroupScanThreadGroups[ThreadGroupScan.ThreadGroupIdx];
+    g_persistent_worker_groups = ThreadGroupScanWorkerGroups[ThreadGroupScan.WorkerGroupIdx];
+    ThreadGroupScan.WarmupStartTime = CurrentSecondsSinceEpoch();
+}
+
+static void BeginThreadGroupScan()
+{
+    ThreadGroupScan = ThreadGroupScanState();
+    ThreadGroupScan.Active = true;
+    ThreadGroupScan.SavedThreadGroupSize = g_wavefront_thread_group_size;
+    ThreadGroupScan.SavedWorkerGroups = g_persistent_worker_groups;
+    ThreadGroupScan.Results = "Thread Group Scan Results\r\n";
+    ThreadGroupScan.Results += "tg_size,num_tg,dispatch_time_ms\r\n";
+    ApplyThreadGroupScanConfig();
+}
+
+static void FinishThreadGroupScan()
+{
+    ThreadGroupScan.Active = false;
+    ThreadGroupScan.Finished = true;
+    g_wavefront_thread_group_size = ThreadGroupScan.SavedThreadGroupSize;
+    g_persistent_worker_groups = ThreadGroupScan.SavedWorkerGroups;
+    ImGui::SetClipboardText(ThreadGroupScan.Results.c_str());
+    OutputDebugStringA(ThreadGroupScan.Results.c_str());
+    WriteLog("%s", ThreadGroupScan.Results.c_str());
+}
+
+static void CancelThreadGroupScan()
+{
+    ThreadGroupScan.Active = false;
+    g_wavefront_thread_group_size = ThreadGroupScan.SavedThreadGroupSize;
+    g_persistent_worker_groups = ThreadGroupScan.SavedWorkerGroups;
+}
+
+static double CurrentScanDispatchTime(const Array<ProfileData>& profiles, uint64 numProfiles,
+                                      const uint64* frameQueryData, uint64 gpuFrequency)
+{
+    double time = CurrentFrameProfileTimeByName(profiles, numProfiles, frameQueryData, gpuFrequency,
+                                                "RayQuery Persistent Warps Dispatch");
+    if(time > 0.0)
+        return time;
+
+    time = CurrentFrameProfileTimeByName(profiles, numProfiles, frameQueryData, gpuFrequency,
+                                         "RayQuery Persistent Wavefront Dispatch");
+    if(time > 0.0)
+        return time;
+
+    return CurrentFrameProfileTimeByName(profiles, numProfiles, frameQueryData, gpuFrequency,
+                                         "RayQuery Wavefront Dispatch");
+}
+
+static void UpdateThreadGroupScan(const Array<ProfileData>& profiles, uint64 numProfiles,
+                                  const uint64* frameQueryData, uint64 gpuFrequency)
+{
+    if(ThreadGroupScan.Active == false)
+        return;
+
+    const double frameTime = CurrentScanDispatchTime(profiles, numProfiles, frameQueryData, gpuFrequency);
+
+    bool warmup_ok{ false };
+
+    auto now = std::chrono::system_clock::now();
+    // Get duration since epoch in milliseconds
+    auto duration = now.time_since_epoch();
+    double secs = CurrentSecondsSinceEpoch();
+    ThreadGroupScan.WarmupElapsedTime = secs - ThreadGroupScan.WarmupStartTime;
+
+    if (ThreadGroupScan.WarmupFrames < ThreadGroupScanWarmupFrames)
+    {
+        ThreadGroupScan.WarmupFrames += 1;
+        warmup_ok = false;
+    }
+    else {
+        warmup_ok = true;
+    }
+
+    if (ThreadGroupScan.WarmupElapsedTime > ThreadGroupScanWarmupSeconds) {
+        warmup_ok = true;
+    }
+
+    if (!warmup_ok) return;
+
+    ThreadGroupScan.SampleSum += frameTime;
+    ThreadGroupScan.SampleFrames += 1;
+
+    if(ThreadGroupScan.SampleFrames < ThreadGroupScanSampleFrames)
+        return;
+
+    const double avgTime = ThreadGroupScan.SampleSum / double(ThreadGroupScan.SampleFrames);
+    char line[128] = { };
+    sprintf_s(line, "%d,%d,%.4f\r\n",
+              ThreadGroupScanThreadGroups[ThreadGroupScan.ThreadGroupIdx],
+              ThreadGroupScanWorkerGroups[ThreadGroupScan.WorkerGroupIdx],
+              avgTime);
+    ThreadGroupScan.Results += line;
+
+    ThreadGroupScan.SampleSum = 0.0;
+    ThreadGroupScan.SampleFrames = 0;
+    ThreadGroupScan.WarmupFrames = 0;
+
+    ThreadGroupScan.WorkerGroupIdx += 1;
+    if(ThreadGroupScan.WorkerGroupIdx >= ArraySize_(ThreadGroupScanWorkerGroups))
+    {
+        ThreadGroupScan.WorkerGroupIdx = 0;
+        ThreadGroupScan.ThreadGroupIdx += 1;
+    }
+
+    if(ThreadGroupScan.ThreadGroupIdx >= ArraySize_(ThreadGroupScanThreadGroups))
+    {
+        FinishThreadGroupScan();
+        return;
+    }
+
+    ApplyThreadGroupScanConfig();
 }
 
 static string BuildWavefrontTimingSummary(const Array<ProfileData>& profiles, uint64 numProfiles)
@@ -532,6 +705,8 @@ void Profiler::EndFrame(uint32 displayWidth, uint32 displayHeight)
         ImGui::Separator();
     }
 
+    UpdateThreadGroupScan(profiles, numProfiles, frameQueryData, gpuFrequency);
+
     // Iterate over all of the profiles
     for(uint64 profileIdx = 0; profileIdx < numProfiles; ++profileIdx)
         UpdateProfile(profiles[profileIdx], profileIdx, drawText, gpuFrequency, frameQueryData);
@@ -559,6 +734,30 @@ void Profiler::EndFrame(uint32 displayWidth, uint32 displayHeight)
             const string summary = BuildWavefrontTimingSummary(profiles, numProfiles);
             ImGui::SetClipboardText(summary.c_str());
         }
+
+        ImGui::Text(" ");
+        if(ThreadGroupScan.Active)
+        {
+            ImGui::Text("Thread group scan: tg=%d num_tg=%d warmup=%u/%ufr,%.1f/%.1fs samples=%u/%u",
+                        ThreadGroupScanThreadGroups[ThreadGroupScan.ThreadGroupIdx],
+                        ThreadGroupScanWorkerGroups[ThreadGroupScan.WorkerGroupIdx],
+                        ThreadGroupScan.WarmupFrames, ThreadGroupScanWarmupFrames,
+                        ThreadGroupScan.WarmupElapsedTime, ThreadGroupScanWarmupSeconds,
+                        ThreadGroupScan.SampleFrames, ThreadGroupScanSampleFrames);
+            if(ImGui::Button("Cancel Thread Group Scan"))
+                CancelThreadGroupScan();
+        }
+        else
+        {
+            if(ImGui::Button("Scan Thread Groups"))
+                BeginThreadGroupScan();
+
+            if(ThreadGroupScan.Finished)
+            {
+                ImGui::SameLine();
+                ImGui::Text("scan complete; results copied to clipboard");
+            }
+        }
     }
     else
         logToClipboard = false;
@@ -568,7 +767,7 @@ void Profiler::EndFrame(uint32 displayWidth, uint32 displayHeight)
     if(enableGPUProfiling)
         readbackBuffer.Unmap();
 
-    enableGPUProfiling = showUI;
+    enableGPUProfiling = showUI || ThreadGroupScan.Active;
 }
 
 double Profiler::GPUProfileTiming(const char* name) const

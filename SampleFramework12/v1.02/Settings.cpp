@@ -875,7 +875,7 @@ void SettingsContainer::Update(uint32 displayWidth, uint32 displayHeight, const 
     ImGui::Checkbox("Thread Block Hit Sort", &g_wavefront_block_sort);
     ImGui::Checkbox("Wavefront Wave Append", &g_wavefront_wave_append);
     {
-        static const int ThreadGroupSizes[] = { 16, 32, 64, 128, 256, 512 };
+        static const int ThreadGroupSizes[] = { 16, 24, 32, 48, 64, 128, 256, 512 };
         char preview[32] = { };
         sprintf_s(preview, "%d", g_wavefront_thread_group_size);
 
