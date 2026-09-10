@@ -17,6 +17,10 @@
 #include "SharedTypes.h"
 #include "AppSettings.hlsl"
 
+#ifndef WAVEFRONT_THREAD_GROUP_SIZE
+#define WAVEFRONT_THREAD_GROUP_SIZE 64
+#endif
+
 struct RayTraceConstants
 {
     row_major float4x4 InvViewProjection;
@@ -44,6 +48,7 @@ struct RayTraceConstants
     uint WavefrontWriteQueue;
     uint WavefrontBounce;
     uint WavefrontPadding;
+    uint WavefrontThreadGroupSize;
 };
 
 struct LightConstants
@@ -158,8 +163,8 @@ static const uint DispatchArgs_Shadows = 2u;
 static const uint DispatchArgs_HitMeta = 3u;
 static const uint DispatchArgsStrideBytes = 12u;
 
-groupshared HitWorkItem SharedBlockSortHits[64];
-groupshared uint SharedBlockSortKeys[64];
+groupshared HitWorkItem SharedBlockSortHits[WAVEFRONT_THREAD_GROUP_SIZE];
+groupshared uint SharedBlockSortKeys[WAVEFRONT_THREAD_GROUP_SIZE];
 
 static float2 SamplePoint(in uint pixelIdx, inout uint setIdx)
 {
@@ -206,7 +211,7 @@ static void StoreHitWorkItem(in uint queueIdx, in uint itemIdx, in HitWorkItem i
 
 static uint WavefrontHitSortKey(in HitWorkItem hitItem)
 {
-    const uint key = hitItem.GeometryIdx | (hitItem.PrimitiveIdx << 16);
+    const uint key = (hitItem.GeometryIdx << 16) | hitItem.PrimitiveIdx;
     return key & (NumReorderBins - 1);
 }
 
@@ -562,7 +567,7 @@ static bool ShadeSurfaceAndSampleNext(
     return true;
 }
 
-[numthreads(64, 1, 1)]
+[numthreads(WAVEFRONT_THREAD_GROUP_SIZE, 1, 1)]
 void WavefrontClearCS(uint3 dispatchThreadID : SV_DispatchThreadID)
 {
     if(dispatchThreadID.x < 4)
@@ -622,7 +627,7 @@ void WavefrontGeneratePrimaryCS(uint3 dispatchThreadID : SV_DispatchThreadID)
         WavefrontCounters[Counter_CurrentRays] = RayTraceCB.TotalNumPixels;
 }
 
-[numthreads(64, 1, 1)]
+[numthreads(WAVEFRONT_THREAD_GROUP_SIZE, 1, 1)]
 void WavefrontTraceHitsCS(uint3 dispatchThreadID : SV_DispatchThreadID)
 {
     const uint workIdx = dispatchThreadID.x;
@@ -668,9 +673,10 @@ void WavefrontTraceHitsCS(uint3 dispatchThreadID : SV_DispatchThreadID)
 [numthreads(1, 1, 1)]
 void WavefrontPrepareDispatchArgsCS(uint3 dispatchThreadID : SV_DispatchThreadID)
 {
-    const uint currentRayGroups = (WavefrontCounters[Counter_CurrentRays] + 63u) / 64u;
-    const uint hitGroups = (WavefrontCounters[Counter_Hits] + 63u) / 64u;
-    const uint shadowGroups = (WavefrontCounters[Counter_Shadows] + 63u) / 64u;
+    const uint groupSize = max(RayTraceCB.WavefrontThreadGroupSize, 1u);
+    const uint currentRayGroups = (WavefrontCounters[Counter_CurrentRays] + groupSize - 1u) / groupSize;
+    const uint hitGroups = (WavefrontCounters[Counter_Hits] + groupSize - 1u) / groupSize;
+    const uint shadowGroups = (WavefrontCounters[Counter_Shadows] + groupSize - 1u) / groupSize;
     const uint hitMetaGroups = WavefrontCounters[Counter_Hits] > 0u ? 1u : 0u;
 
     const uint currentRayOffset = DispatchArgs_CurrentRays * DispatchArgsStrideBytes;
@@ -783,7 +789,7 @@ static void ShadeHitWorkItem(in HitWorkItem hitItem)
     PathStates[hitItem.PathStateIdx] = state;
 }
 
-[numthreads(64, 1, 1)]
+[numthreads(WAVEFRONT_THREAD_GROUP_SIZE, 1, 1)]
 void WavefrontShadeHitsCS(uint3 dispatchThreadID : SV_DispatchThreadID, uint groupIndex : SV_GroupIndex)
 {
     const uint workIdx = dispatchThreadID.x;
@@ -811,7 +817,7 @@ void WavefrontShadeHitsCS(uint3 dispatchThreadID : SV_DispatchThreadID, uint gro
         SharedBlockSortKeys[groupIndex] = validWork ? WavefrontHitSortKey(hitItem) : 0xFFFFFFFFu;
         GroupMemoryBarrierWithGroupSync();
 
-        for(uint sortSize = 2u; sortSize <= 64u; sortSize <<= 1u)
+        for(uint sortSize = 2u; sortSize <= WAVEFRONT_THREAD_GROUP_SIZE; sortSize <<= 1u)
         {
             for(uint compareDistance = sortSize >> 1u; compareDistance > 0u; compareDistance >>= 1u)
             {
@@ -857,7 +863,7 @@ void WavefrontPreparePersistentBounceCS(uint3 dispatchThreadID : SV_DispatchThre
     WavefrontCounters[Counter_WorkCursor] = 0;
 }
 
-[numthreads(64, 1, 1)]
+[numthreads(WAVEFRONT_THREAD_GROUP_SIZE, 1, 1)]
 void WavefrontPersistentTraceShadeCS(uint3 dispatchThreadID : SV_DispatchThreadID)
 {
     while(true)
@@ -924,7 +930,7 @@ void WavefrontPersistentTraceShadeCS(uint3 dispatchThreadID : SV_DispatchThreadI
     }
 }
 
-[numthreads(64, 1, 1)]
+[numthreads(WAVEFRONT_THREAD_GROUP_SIZE, 1, 1)]
 void WavefrontPersistentTraceShadowsCS(uint3 dispatchThreadID : SV_DispatchThreadID)
 {
     while(true)
@@ -1095,7 +1101,7 @@ static void TraceFullPathForPixel(in uint pixelIdx, in uint2 pixelCoord, in uint
     RenderTarget[pixelCoord] = float4(newValue, 1.0f);
 }
 
-[numthreads(64, 1, 1)]
+[numthreads(WAVEFRONT_THREAD_GROUP_SIZE, 1, 1)]
 void PersistentWarpsPathTraceCS(uint3 dispatchThreadID : SV_DispatchThreadID)
 {
     int width;
@@ -1133,7 +1139,7 @@ void PersistentWarpsPathTraceCS(uint3 dispatchThreadID : SV_DispatchThreadID)
     }
 }
 
-[numthreads(64, 1, 1)]
+[numthreads(WAVEFRONT_THREAD_GROUP_SIZE, 1, 1)]
 void WavefrontClearReorderCS(uint3 dispatchThreadID : SV_DispatchThreadID)
 {
     const uint bin = dispatchThreadID.x;
@@ -1144,7 +1150,7 @@ void WavefrontClearReorderCS(uint3 dispatchThreadID : SV_DispatchThreadID)
     }
 }
 
-[numthreads(64, 1, 1)]
+[numthreads(WAVEFRONT_THREAD_GROUP_SIZE, 1, 1)]
 void WavefrontCountReorderBinsCS(uint3 dispatchThreadID : SV_DispatchThreadID)
 {
     const uint workIdx = dispatchThreadID.x;
@@ -1169,7 +1175,7 @@ void WavefrontPrefixReorderBinsCS(uint3 dispatchThreadID : SV_DispatchThreadID)
     }
 }
 
-[numthreads(64, 1, 1)]
+[numthreads(WAVEFRONT_THREAD_GROUP_SIZE, 1, 1)]
 void WavefrontScatterReorderedRaysCS(uint3 dispatchThreadID : SV_DispatchThreadID)
 {
     const uint workIdx = dispatchThreadID.x;
@@ -1184,7 +1190,7 @@ void WavefrontScatterReorderedRaysCS(uint3 dispatchThreadID : SV_DispatchThreadI
     StoreHitWorkItem(RayTraceCB.WavefrontWriteQueue, WavefrontCounters[Counter_ReorderBinOffsets + bin] + localIdx, hitItem);
 }
 
-[numthreads(64, 1, 1)]
+[numthreads(WAVEFRONT_THREAD_GROUP_SIZE, 1, 1)]
 void WavefrontTraceShadowsCS(uint3 dispatchThreadID : SV_DispatchThreadID)
 {
     const uint workIdx = dispatchThreadID.x;
@@ -1205,7 +1211,7 @@ void WavefrontTraceShadowsCS(uint3 dispatchThreadID : SV_DispatchThreadID)
     PathStates[shadow.PathStateIdx] = state;
 }
 
-[numthreads(64, 1, 1)]
+[numthreads(WAVEFRONT_THREAD_GROUP_SIZE, 1, 1)]
 void WavefrontAdvanceCS(uint3 dispatchThreadID : SV_DispatchThreadID)
 {
     if(dispatchThreadID.x == 0)

@@ -39,6 +39,7 @@ extern bool g_wavefront_wave_append;
 extern bool g_persistent_shadow_workers;
 extern int g_persistent_worker_groups;
 extern int g_persistent_batch_waves;
+extern int g_wavefront_thread_group_size;
 
 using namespace SampleFramework12;
 
@@ -65,6 +66,25 @@ StaticAssert_(ArraySize_(SceneCameraRotations) == uint64(Scenes::NumValues));
 StaticAssert_(ArraySize_(SceneSunDirections) == uint64(Scenes::NumValues));
 
 int g_render_path = 0;  // 0=DXR1.0 original, 1=DXR1.0 SER, 2=DXR1.0 loop SER, 3=DXR1.0 loop my, 4=DXR1.1 recursion, 5=DXR1.1 loop, 6=DXR1.1 wavefront, 7=DXR1.1 persistent wavefront, 8=DXR1.1 persistent warps
+int g_wavefront_thread_group_size = 64;
+
+static const uint32 WavefrontThreadGroupSizeVariants[] = { 16, 32, 64, 128, 256, 512 };
+
+static uint32 WavefrontThreadGroupVariantIndex()
+{
+    for(uint32 i = 0; i < ArraySize_(WavefrontThreadGroupSizeVariants); ++i)
+    {
+        if(uint32(g_wavefront_thread_group_size) == WavefrontThreadGroupSizeVariants[i])
+            return i;
+    }
+
+    return 2;
+}
+
+static uint32 ActiveWavefrontThreadGroupSize()
+{
+    return WavefrontThreadGroupSizeVariants[WavefrontThreadGroupVariantIndex()];
+}
 
 static const uint64 NumConeSides = 16;
 
@@ -129,6 +149,7 @@ struct RayTraceConstants
     uint32 WavefrontWriteQueue = 1;
     uint32 WavefrontBounce = 0;
     uint32 WavefrontPadding = 0;
+    uint32 WavefrontThreadGroupSize = 64;
 };
 
 struct WavefrontPathState
@@ -621,6 +642,18 @@ void DXRPathTracer::DestroyPSOs()
     DX12::DeferredRelease(wavefrontScatterReorderedRaysPSO);
     DX12::DeferredRelease(wavefrontAdvancePSO);
     DX12::DeferredRelease(wavefrontAccumulatePSO);
+
+    for(uint32 variantIdx = 0; variantIdx < ArraySize_(WavefrontThreadGroupSizeVariants); ++variantIdx)
+    {
+        DX12::DeferredRelease(wavefrontTraceHitsPSOVariants[variantIdx]);
+        DX12::DeferredRelease(wavefrontShadeHitsPSOVariants[variantIdx]);
+        DX12::DeferredRelease(wavefrontTraceShadowsPSOVariants[variantIdx]);
+        DX12::DeferredRelease(wavefrontPersistentTraceShadePSOVariants[variantIdx]);
+        DX12::DeferredRelease(wavefrontPersistentTraceShadowsPSOVariants[variantIdx]);
+        DX12::DeferredRelease(persistentWarpsPathTracePSOVariants[variantIdx]);
+        DX12::DeferredRelease(wavefrontCountReorderBinsPSOVariants[variantIdx]);
+        DX12::DeferredRelease(wavefrontScatterReorderedRaysPSOVariants[variantIdx]);
+    }
 }
 
 // Creates all required render targets
@@ -933,6 +966,21 @@ void DXRPathTracer::InitRayTracing()
     wavefrontScatterReorderedRaysCS = CompileFromFile(L"WavefrontPathTrace.hlsl", "WavefrontScatterReorderedRaysCS", ShaderType::Compute, co);
     wavefrontAdvanceCS = CompileFromFile(L"WavefrontPathTrace.hlsl", "WavefrontAdvanceCS", ShaderType::Compute, co);
     wavefrontAccumulateCS = CompileFromFile(L"WavefrontPathTrace.hlsl", "WavefrontAccumulateCS", ShaderType::Compute, co);
+
+    for(uint32 variantIdx = 0; variantIdx < ArraySize_(WavefrontThreadGroupSizeVariants); ++variantIdx)
+    {
+        CompileOptions variantOptions = co;
+        variantOptions.Add("WAVEFRONT_THREAD_GROUP_SIZE", WavefrontThreadGroupSizeVariants[variantIdx]);
+
+        wavefrontTraceHitsCSVariants[variantIdx] = CompileFromFile(L"WavefrontPathTrace.hlsl", "WavefrontTraceHitsCS", ShaderType::Compute, variantOptions);
+        wavefrontShadeHitsCSVariants[variantIdx] = CompileFromFile(L"WavefrontPathTrace.hlsl", "WavefrontShadeHitsCS", ShaderType::Compute, variantOptions);
+        wavefrontTraceShadowsCSVariants[variantIdx] = CompileFromFile(L"WavefrontPathTrace.hlsl", "WavefrontTraceShadowsCS", ShaderType::Compute, variantOptions);
+        wavefrontPersistentTraceShadeCSVariants[variantIdx] = CompileFromFile(L"WavefrontPathTrace.hlsl", "WavefrontPersistentTraceShadeCS", ShaderType::Compute, variantOptions);
+        wavefrontPersistentTraceShadowsCSVariants[variantIdx] = CompileFromFile(L"WavefrontPathTrace.hlsl", "WavefrontPersistentTraceShadowsCS", ShaderType::Compute, variantOptions);
+        persistentWarpsPathTraceCSVariants[variantIdx] = CompileFromFile(L"WavefrontPathTrace.hlsl", "PersistentWarpsPathTraceCS", ShaderType::Compute, variantOptions);
+        wavefrontCountReorderBinsCSVariants[variantIdx] = CompileFromFile(L"WavefrontPathTrace.hlsl", "WavefrontCountReorderBinsCS", ShaderType::Compute, variantOptions);
+        wavefrontScatterReorderedRaysCSVariants[variantIdx] = CompileFromFile(L"WavefrontPathTrace.hlsl", "WavefrontScatterReorderedRaysCS", ShaderType::Compute, variantOptions);
+    }
 }
 
 void DXRPathTracer::CreateRayTracingPSOs(const CompiledShaderPtr& shader_ptr, ID3D12StateObject** rtpso,
@@ -1141,6 +1189,33 @@ void DXRPathTracer::CreateRayTracingRayQueryPSOs() {
 
     cpsd.CS = wavefrontAccumulateCS.ByteCode();
     DXCall(DX12::Device->CreateComputePipelineState(&cpsd, IID_PPV_ARGS(&wavefrontAccumulatePSO)));
+
+    for(uint32 variantIdx = 0; variantIdx < ArraySize_(WavefrontThreadGroupSizeVariants); ++variantIdx)
+    {
+        cpsd.CS = wavefrontTraceHitsCSVariants[variantIdx].ByteCode();
+        DXCall(DX12::Device->CreateComputePipelineState(&cpsd, IID_PPV_ARGS(&wavefrontTraceHitsPSOVariants[variantIdx])));
+
+        cpsd.CS = wavefrontShadeHitsCSVariants[variantIdx].ByteCode();
+        DXCall(DX12::Device->CreateComputePipelineState(&cpsd, IID_PPV_ARGS(&wavefrontShadeHitsPSOVariants[variantIdx])));
+
+        cpsd.CS = wavefrontTraceShadowsCSVariants[variantIdx].ByteCode();
+        DXCall(DX12::Device->CreateComputePipelineState(&cpsd, IID_PPV_ARGS(&wavefrontTraceShadowsPSOVariants[variantIdx])));
+
+        cpsd.CS = wavefrontPersistentTraceShadeCSVariants[variantIdx].ByteCode();
+        DXCall(DX12::Device->CreateComputePipelineState(&cpsd, IID_PPV_ARGS(&wavefrontPersistentTraceShadePSOVariants[variantIdx])));
+
+        cpsd.CS = wavefrontPersistentTraceShadowsCSVariants[variantIdx].ByteCode();
+        DXCall(DX12::Device->CreateComputePipelineState(&cpsd, IID_PPV_ARGS(&wavefrontPersistentTraceShadowsPSOVariants[variantIdx])));
+
+        cpsd.CS = persistentWarpsPathTraceCSVariants[variantIdx].ByteCode();
+        DXCall(DX12::Device->CreateComputePipelineState(&cpsd, IID_PPV_ARGS(&persistentWarpsPathTracePSOVariants[variantIdx])));
+
+        cpsd.CS = wavefrontCountReorderBinsCSVariants[variantIdx].ByteCode();
+        DXCall(DX12::Device->CreateComputePipelineState(&cpsd, IID_PPV_ARGS(&wavefrontCountReorderBinsPSOVariants[variantIdx])));
+
+        cpsd.CS = wavefrontScatterReorderedRaysCSVariants[variantIdx].ByteCode();
+        DXCall(DX12::Device->CreateComputePipelineState(&cpsd, IID_PPV_ARGS(&wavefrontScatterReorderedRaysPSOVariants[variantIdx])));
+    }
   }
 }
 
@@ -1645,6 +1720,7 @@ void DXRPathTracer::RenderRayTracing()
     rtConstants.MaterialBufferIdx = meshRenderer.MaterialBuffer().SRV;
     rtConstants.SkyTextureIdx = skyCache.CubeMap.SRV;
     rtConstants.NumLights = Min<uint32>(uint32(spotLights.Size()), AppSettings::MaxLightClamp);
+    rtConstants.WavefrontThreadGroupSize = ActiveWavefrontThreadGroupSize();
 
     rtConstants.myFlags = 0;
     if (g_has_ser && g_use_ser) {
@@ -1662,6 +1738,8 @@ void DXRPathTracer::RenderRayTracing()
 
     rtTarget.MakeWritableUAV(cmdList);
 
+    const uint32 wavefrontVariantIdx = WavefrontThreadGroupVariantIndex();
+
     int activeRenderPath = g_render_path;
     if(activeRenderPath == 1 && rtPSO_SER == nullptr)
         activeRenderPath = 0;
@@ -1673,12 +1751,12 @@ void DXRPathTracer::RenderRayTracing()
         activeRenderPath = 0;
     else if(activeRenderPath == 5 && rtRayQuery1PSO == nullptr)
         activeRenderPath = 0;
-    else if(activeRenderPath == 6 && wavefrontTraceHitsPSO == nullptr)
+    else if(activeRenderPath == 6 && wavefrontTraceHitsPSOVariants[wavefrontVariantIdx] == nullptr)
         activeRenderPath = 5;
-    else if(activeRenderPath == 7 && wavefrontPersistentTraceShadePSO == nullptr)
+    else if(activeRenderPath == 7 && wavefrontPersistentTraceShadePSOVariants[wavefrontVariantIdx] == nullptr)
         activeRenderPath = 6;
-    else if(activeRenderPath == 8 && persistentWarpsPathTracePSO == nullptr)
-        activeRenderPath = wavefrontPersistentTraceShadePSO != nullptr ? 7 : 6;
+    else if(activeRenderPath == 8 && persistentWarpsPathTracePSOVariants[wavefrontVariantIdx] == nullptr)
+        activeRenderPath = wavefrontPersistentTraceShadePSOVariants[wavefrontVariantIdx] != nullptr ? 7 : 6;
 
     switch (activeRenderPath) {
     case 0: {
@@ -1925,7 +2003,7 @@ void DXRPathTracer::RenderRayTracing()
 
           {
               ProfileBlock tracePB(cmdList, TraceHitProfileNames[bounce]);
-              cmdList->SetPipelineState(wavefrontTraceHitsPSO);
+              cmdList->SetPipelineState(wavefrontTraceHitsPSOVariants[wavefrontVariantIdx]);
               cmdList->ExecuteIndirect(wavefrontDispatchCommandSignature, 1, wavefrontDispatchArgsBuffer.Resource(),
                                        currentRayDispatchArgsOffset, nullptr, 0);
               wavefrontPathStateBuffer.UAVBarrier(cmdList);
@@ -1951,7 +2029,7 @@ void DXRPathTracer::RenderRayTracing()
                                            hitMetaDispatchArgsOffset, nullptr, 0);
                   wavefrontCounterBuffer.UAVBarrier(cmdList);
 
-                  cmdList->SetPipelineState(wavefrontCountReorderBinsPSO);
+                  cmdList->SetPipelineState(wavefrontCountReorderBinsPSOVariants[wavefrontVariantIdx]);
                   cmdList->ExecuteIndirect(wavefrontDispatchCommandSignature, 1, wavefrontDispatchArgsBuffer.Resource(),
                                            hitDispatchArgsOffset, nullptr, 0);
                   wavefrontCounterBuffer.UAVBarrier(cmdList);
@@ -1961,7 +2039,7 @@ void DXRPathTracer::RenderRayTracing()
                                            hitMetaDispatchArgsOffset, nullptr, 0);
                   wavefrontCounterBuffer.UAVBarrier(cmdList);
 
-                  cmdList->SetPipelineState(wavefrontScatterReorderedRaysPSO);
+                  cmdList->SetPipelineState(wavefrontScatterReorderedRaysPSOVariants[wavefrontVariantIdx]);
                   cmdList->ExecuteIndirect(wavefrontDispatchCommandSignature, 1, wavefrontDispatchArgsBuffer.Resource(),
                                            hitDispatchArgsOffset, nullptr, 0);
                   wavefrontHitQueueA.UAVBarrier(cmdList);
@@ -1975,7 +2053,7 @@ void DXRPathTracer::RenderRayTracing()
           bindWavefrontConstants(bounce, hitReadQueue, nextQueue);
           {
               ProfileBlock shadePB(cmdList, ShadeHitProfileNames[bounce]);
-              cmdList->SetPipelineState(wavefrontShadeHitsPSO);
+              cmdList->SetPipelineState(wavefrontShadeHitsPSOVariants[wavefrontVariantIdx]);
               cmdList->ExecuteIndirect(wavefrontDispatchCommandSignature, 1, wavefrontDispatchArgsBuffer.Resource(),
                                        hitDispatchArgsOffset, nullptr, 0);
               wavefrontPathStateBuffer.UAVBarrier(cmdList);
@@ -1988,7 +2066,7 @@ void DXRPathTracer::RenderRayTracing()
 
           {
               ProfileBlock shadowPB(cmdList, TraceShadowProfileNames[bounce]);
-              cmdList->SetPipelineState(wavefrontTraceShadowsPSO);
+              cmdList->SetPipelineState(wavefrontTraceShadowsPSOVariants[wavefrontVariantIdx]);
               cmdList->ExecuteIndirect(wavefrontDispatchCommandSignature, 1, wavefrontDispatchArgsBuffer.Resource(),
                                        shadowDispatchArgsOffset, nullptr, 0);
               wavefrontPathStateBuffer.UAVBarrier(cmdList);
@@ -2095,7 +2173,8 @@ void DXRPathTracer::RenderRayTracing()
       const uint32 width = uint32(rtTarget.Width());
       const uint32 height = uint32(rtTarget.Height());
       const uint32 numPixels = width * height;
-      const uint32 pixelGroups = (numPixels + 63) / 64;
+      const uint32 wavefrontThreadGroupSize = ActiveWavefrontThreadGroupSize();
+      const uint32 pixelGroups = (numPixels + wavefrontThreadGroupSize - 1) / wavefrontThreadGroupSize;
       const uint32 persistentGroups = Clamp<uint32>(uint32(g_persistent_worker_groups), 1, Max<uint32>(pixelGroups, 1));
       const uint32 gx = (width + 7) / 8;
       const uint32 gy = (height + 7) / 8;
@@ -2162,7 +2241,7 @@ void DXRPathTracer::RenderRayTracing()
 
           {
               ProfileBlock traceShadePB(cmdList, PersistentTraceShadeProfileNames[bounce]);
-              cmdList->SetPipelineState(wavefrontPersistentTraceShadePSO);
+              cmdList->SetPipelineState(wavefrontPersistentTraceShadePSOVariants[wavefrontVariantIdx]);
               DX12::CmdList->Dispatch(persistentGroups, 1, 1);
               wavefrontPathStateBuffer.UAVBarrier(cmdList);
               wavefrontRayQueueA.UAVBarrier(cmdList);
@@ -2182,7 +2261,7 @@ void DXRPathTracer::RenderRayTracing()
 
               {
                   ProfileBlock shadowPB(cmdList, PersistentTraceShadowProfileNames[bounce]);
-                  cmdList->SetPipelineState(wavefrontPersistentTraceShadowsPSO);
+                  cmdList->SetPipelineState(wavefrontPersistentTraceShadowsPSOVariants[wavefrontVariantIdx]);
                   DX12::CmdList->Dispatch(persistentGroups, 1, 1);
                   wavefrontPathStateBuffer.UAVBarrier(cmdList);
                   wavefrontCounterBuffer.UAVBarrier(cmdList);
@@ -2194,7 +2273,7 @@ void DXRPathTracer::RenderRayTracing()
 
               {
                   ProfileBlock shadowPB(cmdList, PersistentTraceShadowProfileNames[bounce]);
-                  cmdList->SetPipelineState(wavefrontTraceShadowsPSO);
+                  cmdList->SetPipelineState(wavefrontTraceShadowsPSOVariants[wavefrontVariantIdx]);
                   cmdList->ExecuteIndirect(wavefrontDispatchCommandSignature, 1, wavefrontDispatchArgsBuffer.Resource(),
                                            shadowDispatchArgsOffset, nullptr, 0);
                   wavefrontPathStateBuffer.UAVBarrier(cmdList);
@@ -2242,7 +2321,8 @@ void DXRPathTracer::RenderRayTracing()
       const uint32 width = uint32(rtTarget.Width());
       const uint32 height = uint32(rtTarget.Height());
       const uint32 numPixels = width * height;
-      const uint32 pixelGroups = (numPixels + 63) / 64;
+      const uint32 wavefrontThreadGroupSize = ActiveWavefrontThreadGroupSize();
+      const uint32 pixelGroups = (numPixels + wavefrontThreadGroupSize - 1) / wavefrontThreadGroupSize;
       const uint32 persistentGroups = Clamp<uint32>(uint32(g_persistent_worker_groups), 1, Max<uint32>(pixelGroups, 1));
 
       rtConstants.myFlags &= ~(2u | 4u);
@@ -2268,7 +2348,7 @@ void DXRPathTracer::RenderRayTracing()
 
       {
           ProfileBlock tracePB(cmdList, "Persistent Warps Path Trace");
-          cmdList->SetPipelineState(persistentWarpsPathTracePSO);
+          cmdList->SetPipelineState(persistentWarpsPathTracePSOVariants[wavefrontVariantIdx]);
           DX12::CmdList->Dispatch(persistentGroups, 1, 1);
           wavefrontCounterBuffer.UAVBarrier(cmdList);
           rtTarget.UAVBarrier(cmdList);

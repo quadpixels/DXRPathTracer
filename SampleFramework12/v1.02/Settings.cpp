@@ -25,6 +25,7 @@ extern bool g_wavefront_wave_append;
 extern bool g_persistent_shadow_workers;
 extern int g_persistent_worker_groups;
 extern int g_persistent_batch_waves;
+extern int g_wavefront_thread_group_size;
 
 namespace SampleFramework12
 {
@@ -873,8 +874,58 @@ void SettingsContainer::Update(uint32 displayWidth, uint32 displayHeight, const 
     ImGui::Checkbox("Skip Primary Hit Sort", &g_wavefront_skip_primary_sort);
     ImGui::Checkbox("Thread Block Hit Sort", &g_wavefront_block_sort);
     ImGui::Checkbox("Wavefront Wave Append", &g_wavefront_wave_append);
+    {
+        static const int ThreadGroupSizes[] = { 16, 32, 64, 128, 256, 512 };
+        char preview[32] = { };
+        sprintf_s(preview, "%d", g_wavefront_thread_group_size);
+
+        if(ImGui::BeginCombo("Wavefront Thread Group Size", preview))
+        {
+            for(uint64 sizeIdx = 0; sizeIdx < ArraySize_(ThreadGroupSizes); ++sizeIdx)
+            {
+                char label[32] = { };
+                sprintf_s(label, "%d", ThreadGroupSizes[sizeIdx]);
+                const bool selected = g_wavefront_thread_group_size == ThreadGroupSizes[sizeIdx];
+                if(ImGui::Selectable(label, selected))
+                    g_wavefront_thread_group_size = ThreadGroupSizes[sizeIdx];
+                if(selected)
+                    ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+    }
     ImGui::Checkbox("Persistent Shadow Workers", &g_persistent_shadow_workers);
-    ImGui::SliderInt("Persistent Worker Groups", &g_persistent_worker_groups, 64, 4096);
+    {
+        static const int WorkerGroupPresets[] = { 8, 16, 32, 64, 128, 256, 512, 1024, 2048 };
+        static int pendingWorkerGroups = 0;
+        if(pendingWorkerGroups == 0)
+            pendingWorkerGroups = g_persistent_worker_groups;
+
+        char preview[32] = { };
+        sprintf_s(preview, "%d", pendingWorkerGroups);
+
+        if(ImGui::BeginCombo("Persistent Worker Groups", preview))
+        {
+            for(uint64 presetIdx = 0; presetIdx < ArraySize_(WorkerGroupPresets); ++presetIdx)
+            {
+                char label[32] = { };
+                sprintf_s(label, "%d", WorkerGroupPresets[presetIdx]);
+                const bool selected = pendingWorkerGroups == WorkerGroupPresets[presetIdx];
+                if(ImGui::Selectable(label, selected))
+                    pendingWorkerGroups = WorkerGroupPresets[presetIdx];
+                if(selected)
+                    ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+
+        ImGui::InputInt("Persistent Worker Groups Custom", &pendingWorkerGroups);
+        if(pendingWorkerGroups < 1)
+            pendingWorkerGroups = 1;
+
+        if(ImGui::Button("Apply Persistent Worker Groups"))
+            g_persistent_worker_groups = pendingWorkerGroups;
+    }
     ImGui::SliderInt("Persistent Batch Waves", &g_persistent_batch_waves, 1, 8);
     ImGui::RadioButton("DXR1.0 (original)", &g_render_path, 0);
     ImGui::RadioButton("DXR1.0 (recursion, SER)", &g_render_path, 1);

@@ -25,6 +25,7 @@ extern bool g_wavefront_wave_append;
 extern bool g_persistent_shadow_workers;
 extern int g_persistent_worker_groups;
 extern int g_persistent_batch_waves;
+extern int g_wavefront_thread_group_size;
 
 namespace SampleFramework12
 {
@@ -385,6 +386,9 @@ static string BuildWavefrontTimingSummary(const Array<ProfileData>& profiles, ui
     text += g_wavefront_skip_primary_sort ? " (skip B0)\r\n" : " (include B0)\r\n";
     text += "Append Mode: ";
     text += g_wavefront_wave_append ? "Wave aggregated atomics\r\n" : "Per-item atomics\r\n";
+    char threadGroupLine[128] = { };
+    sprintf_s(threadGroupLine, "Thread Group Size: %d\r\n", g_wavefront_thread_group_size);
+    text += threadGroupLine;
     AppendTimingLine(text, "RayQuery Wavefront Dispatch", ProfileTimeByName(profiles, numProfiles, "RayQuery Wavefront Dispatch"));
     AppendTimingLine(text, "WF Clear", ProfileTimeByName(profiles, numProfiles, "WF Clear"));
     AppendTimingLine(text, "WF Generate Primary", ProfileTimeByName(profiles, numProfiles, "WF Generate Primary"));
@@ -438,8 +442,8 @@ static string BuildWavefrontTimingSummary(const Array<ProfileData>& profiles, ui
         text += "\r\nPersistent Wavefront GPU timing summary\r\n";
         text += "=======================================\r\n";
         char settingsLine[256] = { };
-        sprintf_s(settingsLine, "Persistent Wavefront Settings: worker groups=%d, batch waves=%d, shadow=%s\r\n",
-                  g_persistent_worker_groups, g_persistent_batch_waves,
+        sprintf_s(settingsLine, "Persistent Wavefront Settings: worker groups=%d, thread group size=%d, batch waves=%d, shadow=%s\r\n",
+                  g_persistent_worker_groups, g_wavefront_thread_group_size, g_persistent_batch_waves,
                   g_persistent_shadow_workers ? "persistent shadow workers" : "indirect dispatch");
         text += settingsLine;
         AppendTimingLine(text, "RayQuery Persistent Wavefront", persistentTotal);
@@ -470,8 +474,8 @@ static string BuildWavefrontTimingSummary(const Array<ProfileData>& profiles, ui
         text += "\r\nPersistent Warps GPU timing summary\r\n";
         text += "===================================\r\n";
         char settingsLine[256] = { };
-        sprintf_s(settingsLine, "Persistent Warps Settings: worker groups=%d, batch waves=%d\r\n",
-                  g_persistent_worker_groups, g_persistent_batch_waves);
+        sprintf_s(settingsLine, "Persistent Warps Settings: worker groups=%d, thread group size=%d, batch waves=%d\r\n",
+                  g_persistent_worker_groups, g_wavefront_thread_group_size, g_persistent_batch_waves);
         text += settingsLine;
         AppendTimingLine(text, "RayQuery Persistent Warps", persistentWarpsTotal);
         AppendTimingLine(text, "Persistent Warps Clear", ProfileTimeByName(profiles, numProfiles, "Persistent Warps Clear"));
