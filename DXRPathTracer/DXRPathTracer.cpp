@@ -2159,6 +2159,13 @@ void DXRPathTracer::RenderRayTracing()
       }
 
       {
+          ProfileBlock preparePB(cmdList, "Persistent Global Queue Prepare");
+          cmdList->SetPipelineState(wavefrontPreparePersistentBouncePSO);
+          DX12::CmdList->Dispatch(1, 1, 1);
+          wavefrontCounterBuffer.UAVBarrier(cmdList);
+      }
+
+      {
           ProfileBlock generatePB(cmdList, "Persistent Global Queue Generate Primary");
           cmdList->SetPipelineState(wavefrontGeneratePrimaryPSO);
           DX12::CmdList->Dispatch(gx, gy, 1);
