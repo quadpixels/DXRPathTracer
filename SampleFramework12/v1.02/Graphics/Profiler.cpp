@@ -383,6 +383,11 @@ static double CurrentScanDispatchTime(const Array<ProfileData>& profiles, uint64
     if(time > 0.0)
         return time;
 
+    time = CurrentFrameProfileTimeByName(profiles, numProfiles, frameQueryData, gpuFrequency,
+                                         "RayQuery GPU Wavefront Dispatch");
+    if(time > 0.0)
+        return time;
+
     return CurrentFrameProfileTimeByName(profiles, numProfiles, frameQueryData, gpuFrequency,
                                          "RayQuery Wavefront Dispatch");
 }

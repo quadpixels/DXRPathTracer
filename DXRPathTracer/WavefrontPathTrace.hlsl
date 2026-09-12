@@ -156,11 +156,14 @@ static const uint QueueB = 1u;
 static const uint RayTraceFlag_EnableWavefrontReorder = 2u;
 static const uint RayTraceFlag_EnableWavefrontBlockSort = 4u;
 static const uint RayTraceFlag_EnableWavefrontWaveAppend = 8u;
+static const uint RayTraceFlag_PersistentUnifiedQueue = 16u;
 static const uint NumReorderBins = 64u;
 static const uint DispatchArgs_CurrentRays = 0u;
 static const uint DispatchArgs_Hits = 1u;
 static const uint DispatchArgs_Shadows = 2u;
 static const uint DispatchArgs_HitMeta = 3u;
+static const uint DispatchArgs_SortHits = 4u;
+static const uint DispatchArgs_ScatterHits = 5u;
 static const uint DispatchArgsStrideBytes = 12u;
 
 groupshared HitWorkItem SharedBlockSortHits[WAVEFRONT_THREAD_GROUP_SIZE];
@@ -580,7 +583,7 @@ static bool ShadeSurfaceAndSampleNext(
 [numthreads(WAVEFRONT_THREAD_GROUP_SIZE, 1, 1)]
 void WavefrontClearCS(uint3 dispatchThreadID : SV_DispatchThreadID)
 {
-    if(dispatchThreadID.x < 4)
+    if(dispatchThreadID.x < 4 || dispatchThreadID.x == Counter_WorkCursor)
         WavefrontCounters[dispatchThreadID.x] = 0;
 }
 
@@ -687,7 +690,10 @@ void WavefrontPrepareDispatchArgsCS(uint3 dispatchThreadID : SV_DispatchThreadID
     const uint currentRayGroups = (WavefrontCounters[Counter_CurrentRays] + groupSize - 1u) / groupSize;
     const uint hitGroups = (WavefrontCounters[Counter_Hits] + groupSize - 1u) / groupSize;
     const uint shadowGroups = (WavefrontCounters[Counter_Shadows] + groupSize - 1u) / groupSize;
-    const uint hitMetaGroups = WavefrontCounters[Counter_Hits] > 0u ? 1u : 0u;
+    const bool globalSortEnabled = (RayTraceCB.myFlags & RayTraceFlag_EnableWavefrontReorder) != 0u &&
+                                   (RayTraceCB.myFlags & RayTraceFlag_EnableWavefrontBlockSort) == 0u;
+    const uint hitMetaGroups = globalSortEnabled && WavefrontCounters[Counter_Hits] > 0u ? 1u : 0u;
+    const uint sortHitGroups = globalSortEnabled ? hitGroups : 0u;
 
     const uint currentRayOffset = DispatchArgs_CurrentRays * DispatchArgsStrideBytes;
     WavefrontDispatchArgs.Store(currentRayOffset + 0u, currentRayGroups);
@@ -708,6 +714,16 @@ void WavefrontPrepareDispatchArgsCS(uint3 dispatchThreadID : SV_DispatchThreadID
     WavefrontDispatchArgs.Store(hitMetaOffset + 0u, hitMetaGroups);
     WavefrontDispatchArgs.Store(hitMetaOffset + 4u, 1u);
     WavefrontDispatchArgs.Store(hitMetaOffset + 8u, 1u);
+
+    const uint sortHitOffset = DispatchArgs_SortHits * DispatchArgsStrideBytes;
+    WavefrontDispatchArgs.Store(sortHitOffset + 0u, sortHitGroups);
+    WavefrontDispatchArgs.Store(sortHitOffset + 4u, 1u);
+    WavefrontDispatchArgs.Store(sortHitOffset + 8u, 1u);
+
+    const uint scatterHitOffset = DispatchArgs_ScatterHits * DispatchArgsStrideBytes;
+    WavefrontDispatchArgs.Store(scatterHitOffset + 0u, sortHitGroups);
+    WavefrontDispatchArgs.Store(scatterHitOffset + 4u, 1u);
+    WavefrontDispatchArgs.Store(scatterHitOffset + 8u, 1u);
 }
 
 static void ShadeHitWorkItem(in HitWorkItem hitItem)
@@ -735,10 +751,22 @@ static void ShadeHitWorkItem(in HitWorkItem hitItem)
 
     if(any(sunContribution != 0.0.xxx))
     {
-        const uint shadowIdx = AllocateQueueIndex(Counter_Shadows, true);
         sunShadow.Contribution = state.Throughput * sunContribution;
         sunShadow.PathStateIdx = hitItem.PathStateIdx;
-        ShadowQueue[shadowIdx] = sunShadow;
+        if((RayTraceCB.myFlags & RayTraceFlag_PersistentUnifiedQueue) != 0u)
+        {
+            RayDesc shadowRay;
+            shadowRay.Origin = sunShadow.Origin;
+            shadowRay.Direction = sunShadow.Direction;
+            shadowRay.TMin = sunShadow.TMin;
+            shadowRay.TMax = sunShadow.TMax;
+            state.Radiance += TraceShadowInline(shadowRay, 0xFFFFFFFF, sunShadow.RayFlags) * sunShadow.Contribution;
+        }
+        else
+        {
+            const uint shadowIdx = AllocateQueueIndex(Counter_Shadows, true);
+            ShadowQueue[shadowIdx] = sunShadow;
+        }
     }
 
     if(next.Valid == false)
@@ -794,8 +822,16 @@ static void ShadeHitWorkItem(in HitWorkItem hitItem)
     nextRay.Padding1 = 0;
     nextRay.Padding2 = 0;
 
-    const uint nextIdx = AllocateQueueIndex(Counter_NextRays, true);
-    StoreRayWorkItem(RayTraceCB.WavefrontWriteQueue, nextIdx, nextRay);
+    if((RayTraceCB.myFlags & RayTraceFlag_PersistentUnifiedQueue) != 0u)
+    {
+        const uint nextIdx = AllocateQueueIndex(Counter_CurrentRays, true);
+        StoreRayWorkItem(QueueA, nextIdx, nextRay);
+    }
+    else
+    {
+        const uint nextIdx = AllocateQueueIndex(Counter_NextRays, true);
+        StoreRayWorkItem(RayTraceCB.WavefrontWriteQueue, nextIdx, nextRay);
+    }
     PathStates[hitItem.PathStateIdx] = state;
 }
 
@@ -903,6 +939,75 @@ void WavefrontPersistentTraceShadeCS(uint3 dispatchThreadID : SV_DispatchThreadI
             if(validWork)
             {
                 RayWorkItem rayItem = LoadRayWorkItem(RayTraceCB.WavefrontReadQueue, workIdx);
+                PathState state = PathStates[rayItem.PathStateIdx];
+
+                RayDesc ray;
+                ray.Origin = rayItem.Origin;
+                ray.Direction = rayItem.Direction;
+                ray.TMin = rayItem.TMin;
+                ray.TMax = rayItem.TMax;
+
+                uint rayFlags = 0;
+                if(state.PathLength > AppSettings.MaxAnyHitPathLength)
+                    rayFlags |= RAY_FLAG_FORCE_OPAQUE;
+
+                HitInfoRQ hit = TraceClosestHitInline_Radiance(ray, 0xFFFFFFFF, rayFlags);
+
+                if(hit.Hit == false)
+                {
+                    state.Radiance += state.Throughput * EvaluateMissRadiance(ray.Direction, state.PathLength);
+                    PathStates[rayItem.PathStateIdx] = state;
+                }
+                else
+                {
+                    HitWorkItem hitItem;
+                    hitItem.PathStateIdx = rayItem.PathStateIdx;
+                    hitItem.GeometryIdx = hit.GeometryIdx;
+                    hitItem.PrimitiveIdx = hit.PrimitiveIdx;
+                    hitItem.Bary = hit.Bary;
+                    hitItem.RayOrigin = ray.Origin;
+                    hitItem.RayT = hit.T;
+                    hitItem.RayDirection = ray.Direction;
+                    hitItem.Padding = 0;
+
+                    ShadeHitWorkItem(hitItem);
+                }
+            }
+        }
+    }
+}
+
+// Persistent workers consume a single append-only queue. Each hit may append
+// the next bounce back to the same queue, so no CPU-side bounce loop is needed.
+[numthreads(WAVEFRONT_THREAD_GROUP_SIZE, 1, 1)]
+void WavefrontPersistentWorkQueueCS(uint3 dispatchThreadID : SV_DispatchThreadID)
+{
+    while(true)
+    {
+        uint waveBaseIdx = 0;
+        const uint laneIdx = ActiveWaveLaneIndex();
+        const uint waveSize = ActiveWaveLaneCount();
+        const uint batchWaves = max(RayTraceCB.WavefrontPadding, 1u);
+        const uint batchSize = waveSize * batchWaves;
+
+        if(WaveIsFirstLane())
+            InterlockedAdd(WavefrontCounters[Counter_WorkCursor], batchSize, waveBaseIdx);
+
+        waveBaseIdx = WaveReadLaneFirst(waveBaseIdx);
+        const uint queueTail = WavefrontCounters[Counter_CurrentRays];
+        const bool batchHasWork = waveBaseIdx < queueTail;
+
+        if(WaveActiveAnyTrue(batchHasWork) == false)
+            break;
+
+        for(uint batchWave = 0; batchWave < batchWaves; ++batchWave)
+        {
+            const uint workIdx = waveBaseIdx + batchWave * waveSize + laneIdx;
+            const bool validWork = workIdx < WavefrontCounters[Counter_CurrentRays];
+
+            if(validWork)
+            {
+                RayWorkItem rayItem = RayQueueA[workIdx];
                 PathState state = PathStates[rayItem.PathStateIdx];
 
                 RayDesc ray;
@@ -1194,6 +1299,15 @@ void WavefrontScatterReorderedRaysCS(uint3 dispatchThreadID : SV_DispatchThreadI
         return;
 
     HitWorkItem hitItem = LoadHitWorkItem(RayTraceCB.WavefrontReadQueue, workIdx);
+
+    const bool globalSortEnabled = (RayTraceCB.myFlags & RayTraceFlag_EnableWavefrontReorder) != 0u &&
+                                   (RayTraceCB.myFlags & RayTraceFlag_EnableWavefrontBlockSort) == 0u;
+    if(globalSortEnabled == false)
+    {
+        StoreHitWorkItem(RayTraceCB.WavefrontWriteQueue, workIdx, hitItem);
+        return;
+    }
+
     const uint bin = WavefrontHitSortKey(hitItem);
 
     uint localIdx = 0;
