@@ -1751,6 +1751,17 @@ void DXRPathTracer::RenderRayTracing()
 
     rtTarget.MakeWritableUAV(cmdList);
 
+    auto clearWavefrontCounters = [&]()
+    {
+        D3D12_CPU_DESCRIPTOR_HANDLE counterUAV = wavefrontCounterBuffer.UAV;
+        D3D12_GPU_DESCRIPTOR_HANDLE counterUAVGPU = DX12::TempDescriptorTable(&counterUAV, 1);
+        const uint32 clearValues[4] = { 0, 0, 0, 0 };
+        cmdList->ClearUnorderedAccessViewUint(counterUAVGPU, counterUAV,
+                                              wavefrontCounterBuffer.InternalBuffer.Resource,
+                                              clearValues, 0, nullptr);
+        wavefrontCounterBuffer.UAVBarrier(cmdList);
+    };
+
     const uint32 wavefrontVariantIdx = WavefrontThreadGroupVariantIndex();
 
     int activeRenderPath = g_render_path;
@@ -2000,10 +2011,8 @@ void DXRPathTracer::RenderRayTracing()
 
       bindWavefrontConstants(0, 0, 1);
       {
-          ProfileBlock clearPB(cmdList, "WF Clear");
-          cmdList->SetPipelineState(wavefrontClearPSO);
-          DX12::CmdList->Dispatch(1, 1, 1);
-          wavefrontCounterBuffer.UAVBarrier(cmdList);
+      ProfileBlock clearPB(cmdList, "WF Clear");
+          clearWavefrontCounters();
       }
 
       {
@@ -2118,8 +2127,6 @@ void DXRPathTracer::RenderRayTracing()
       break;
     }
     case 10: {
-      ProfileBlock pb(cmdList, "RayQuery Persistent Wavefront Global Queue Dispatch");
-
       D3D12_CPU_DESCRIPTOR_HANDLE uavs[] =
       {
           rtTarget.UAV,
@@ -2133,6 +2140,11 @@ void DXRPathTracer::RenderRayTracing()
           wavefrontDispatchArgsBuffer.UAV,
       };
       DX12::BindTempDescriptorTable(cmdList, uavs, ArraySize_(uavs), RTParams_UAVDescriptor, CmdListMode::Compute);
+
+      // Clear all queue counters in one command before profiling the path.
+      clearWavefrontCounters();
+
+      ProfileBlock pb(cmdList, "RayQuery Persistent Wavefront Global Queue Dispatch");
 
       const uint32 width = uint32(rtTarget.Width());
       const uint32 height = uint32(rtTarget.Height());
@@ -2150,20 +2162,6 @@ void DXRPathTracer::RenderRayTracing()
       rtConstants.WavefrontPadding = Clamp<uint32>(uint32(g_persistent_batch_waves), 1, 8);
       rtConstants.WavefrontThreadGroupSize = wavefrontThreadGroupSize;
       DX12::BindTempConstantBuffer(cmdList, rtConstants, RTParams_CBuffer, CmdListMode::Compute);
-
-      {
-          ProfileBlock clearPB(cmdList, "Persistent Global Queue Clear");
-          cmdList->SetPipelineState(wavefrontClearPSO);
-          DX12::CmdList->Dispatch(1, 1, 1);
-          wavefrontCounterBuffer.UAVBarrier(cmdList);
-      }
-
-      {
-          ProfileBlock preparePB(cmdList, "Persistent Global Queue Prepare");
-          cmdList->SetPipelineState(wavefrontPreparePersistentBouncePSO);
-          DX12::CmdList->Dispatch(1, 1, 1);
-          wavefrontCounterBuffer.UAVBarrier(cmdList);
-      }
 
       {
           ProfileBlock generatePB(cmdList, "Persistent Global Queue Generate Primary");
@@ -2310,10 +2308,8 @@ void DXRPathTracer::RenderRayTracing()
 
       bindWavefrontConstants(0, 0, 1);
       {
-          ProfileBlock clearPB(cmdList, "Persistent Clear");
-          cmdList->SetPipelineState(wavefrontClearPSO);
-          DX12::CmdList->Dispatch(1, 1, 1);
-          wavefrontCounterBuffer.UAVBarrier(cmdList);
+      ProfileBlock clearPB(cmdList, "Persistent Clear");
+          clearWavefrontCounters();
       }
 
       {
@@ -2432,10 +2428,8 @@ void DXRPathTracer::RenderRayTracing()
       DX12::BindTempConstantBuffer(cmdList, rtConstants, RTParams_CBuffer, CmdListMode::Compute);
 
       {
-          ProfileBlock clearPB(cmdList, "Persistent Warps Clear");
-          cmdList->SetPipelineState(wavefrontClearPSO);
-          DX12::CmdList->Dispatch(1, 1, 1);
-          wavefrontCounterBuffer.UAVBarrier(cmdList);
+      ProfileBlock clearPB(cmdList, "Persistent Warps Clear");
+          clearWavefrontCounters();
       }
 
       {
