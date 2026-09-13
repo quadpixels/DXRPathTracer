@@ -37,6 +37,7 @@ bool g_wavefront_reorder = false;
 bool g_wavefront_skip_primary_sort = true;
 bool g_wavefront_block_sort = false;
 bool g_wavefront_wave_append = true;
+bool g_wavefront_use_clear_uav = true;
 bool g_persistent_shadow_workers = true;
 int g_persistent_worker_groups = 1024;
 int g_persistent_batch_waves = 1;
