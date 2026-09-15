@@ -68,6 +68,26 @@ StaticAssert_(ArraySize_(SceneSunDirections) == uint64(Scenes::NumValues));
 
 int g_render_path = 0;  // 0=DXR1.0 original, 1=DXR1.0 SER, 2=DXR1.0 loop SER, 3=DXR1.0 loop my, 4=DXR1.1 recursion, 5=DXR1.1 loop, 6=DXR1.1 wavefront, 7=DXR1.1 persistent wavefront, 8=DXR1.1 persistent warps, 9=DXR1.1 GPU wavefront, 10=DXR1.1 persistent wavefront global queue
 int g_wavefront_thread_group_size = 64;
+static int g_commandLinePreset = 0;
+
+void ApplyPreset(int preset)
+{
+    if(preset < 1 || preset > 12)
+        return;
+
+    const int mode = (preset - 1) % 4;
+    const int config = (preset - 1) / 4;
+    static const int renderPaths[] = { 0, 6, 8, 10 };
+    static const int pathLengths[] = { 3, 8, 8 };
+    static const int anyHitPathLengths[] = { 1, 1, 8 };
+
+    AppSettings::CurrentScene.SetValue(Scenes::SunTemple);
+    AppSettings::StablePowerState.SetValue(true);
+    AppSettings::AlwaysResetPathTrace.SetValue(true);
+    g_render_path = renderPaths[mode];
+    AppSettings::MaxPathLength.SetValue(pathLengths[config]);
+    AppSettings::MaxAnyHitPathLength.SetValue(anyHitPathLengths[config]);
+}
 
 static const uint32 WavefrontThreadGroupSizeVariants[] = { 16, 24, 32, 48, 64, 128, 256, 512 };
 
@@ -151,6 +171,8 @@ struct RayTraceConstants
     uint32 WavefrontBounce = 0;
     uint32 WavefrontPadding = 0;
     uint32 WavefrontThreadGroupSize = 64;
+    uint32 DispatchWidth = 0;
+    uint32 DispatchHeight = 0;
 };
 
 struct WavefrontPathState
@@ -289,6 +311,9 @@ void DXRPathTracer::Initialize()
         AppSettings::AlwaysResetPathTrace.SetValue(true);
         AppSettings::CurrentScene.SetValue(Scenes::SunTemple);
     }
+
+    if(g_commandLinePreset != 0)
+        ApplyPreset(g_commandLinePreset);
 
     // Check if the device supports conservative rasterization
     D3D12_FEATURE_DATA_D3D12_OPTIONS features = { };
@@ -1726,6 +1751,8 @@ void DXRPathTracer::RenderRayTracing()
     rtConstants.CameraPosWS = camera.Position();
     rtConstants.CurrSampleIdx = rtCurrSampleIdx;
     rtConstants.TotalNumPixels = uint32(rtTarget.Width()) * uint32(rtTarget.Height());
+    rtConstants.DispatchWidth = uint32(rtTarget.Width());
+    rtConstants.DispatchHeight = uint32(rtTarget.Height());
 
     rtConstants.VtxBufferIdx = currentModel->VertexBuffer().SRV;
     rtConstants.VtxFloatBufferIdx = currentModel->VertexFloatBuffer().SRV;
@@ -1807,6 +1834,19 @@ void DXRPathTracer::RenderRayTracing()
       dispatchDesc.RayGenerationShaderRecord = rtRayGenTable.ShaderRecord(0);
       dispatchDesc.Width = uint32(rtTarget.Width());
       dispatchDesc.Height = uint32(rtTarget.Height());
+      dispatchDesc.Depth = 1;
+      DX12::CmdList->DispatchRays(&dispatchDesc);
+      break;
+    }
+    case 11: {
+      ProfileBlock pb(cmdList, "TraceRay DispatchRays (DXR 1.0 Persistent Warp)");
+      cmdList->SetPipelineState1(rtPSO);
+      D3D12_DISPATCH_RAYS_DESC dispatchDesc = {};
+      dispatchDesc.HitGroupTable = rtHitTable.ShaderTable();
+      dispatchDesc.MissShaderTable = rtMissTable.ShaderTable();
+      dispatchDesc.RayGenerationShaderRecord = rtRayGenTable.ShaderRecord(0);
+      dispatchDesc.Width = ActiveWavefrontThreadGroupSize();
+      dispatchDesc.Height = uint32(Max<int>(g_persistent_worker_groups, 1));
       dispatchDesc.Depth = 1;
       DX12::CmdList->DispatchRays(&dispatchDesc);
       break;
@@ -2701,6 +2741,30 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
     freopen_s((FILE**)stdin, "CONIN$", "r", stderr);
     freopen_s((FILE**)stdout, "CONOUT$", "w", stdout);
     freopen_s((FILE**)stderr, "CONOUT$", "w", stderr);
+    const wchar* commandLine = lpCmdLine;
+    while(commandLine != nullptr && *commandLine != L'\0')
+    {
+        while(*commandLine == L' ' || *commandLine == L'\t')
+            ++commandLine;
+        if(*commandLine == L'\0')
+            break;
+
+        const wchar* tokenStart = commandLine;
+        while(*commandLine != L'\0' && *commandLine != L' ' && *commandLine != L'\t')
+            ++commandLine;
+        const size_t tokenLength = size_t(commandLine - tokenStart);
+        if(tokenLength == 7 && _wcsnicmp(tokenStart, L"-preset", tokenLength) == 0)
+        {
+            while(*commandLine == L' ' || *commandLine == L'\t')
+                ++commandLine;
+            wchar* end = nullptr;
+            long value = wcstol(commandLine, &end, 10);
+            if(end != commandLine && value >= 1 && value <= 12)
+                g_commandLinePreset = int(value);
+            break;
+        }
+    }
+
     DXRPathTracer app(lpCmdLine);
     app.Run();
 }

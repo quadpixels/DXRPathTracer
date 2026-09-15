@@ -44,6 +44,13 @@ struct RayTraceConstants
     uint NumLights;
     
     uint myFlags;
+    uint WavefrontReadQueue;
+    uint WavefrontWriteQueue;
+    uint WavefrontBounce;
+    uint WavefrontPadding;
+    uint WavefrontThreadGroupSize;
+    uint DispatchWidth;
+    uint DispatchHeight;
 };
 
 struct LightConstants
@@ -95,16 +102,20 @@ static float2 SamplePoint(in uint pixelIdx, inout uint setIdx)
 [shader("raygeneration")]
 void RaygenShader()
 {
-    const uint2 pixelCoord = DispatchRaysIndex().xy;
-    const uint pixelIdx = pixelCoord.y * DispatchRaysDimensions().x + pixelCoord.x;
+    const uint3 dispatchIndex = DispatchRaysIndex();
+    const uint dispatchIdx = dispatchIndex.y * DispatchRaysDimensions().x + dispatchIndex.x;
+    const uint dispatchStride = DispatchRaysDimensions().x * DispatchRaysDimensions().y;
 
+    for(uint pixelIdx = dispatchIdx; pixelIdx < RayTraceCB.TotalNumPixels; pixelIdx += dispatchStride)
+    {
+    const uint2 pixelCoord = uint2(pixelIdx % RayTraceCB.DispatchWidth, pixelIdx / RayTraceCB.DispatchWidth);
     uint sampleSetIdx = 0;
 
     // Form a primary ray by un-projecting the pixel coordinate using the inverse view * projection matrix
     float2 primaryRaySample = SamplePoint(pixelIdx, sampleSetIdx);
 
     float2 rayPixelPos = pixelCoord + primaryRaySample;
-    float2 ncdXY = (rayPixelPos / (DispatchRaysDimensions().xy * 0.5f)) - 1.0f;
+    float2 ncdXY = (rayPixelPos / (float2(RayTraceCB.DispatchWidth, RayTraceCB.DispatchHeight) * 0.5f)) - 1.0f;
     ncdXY.y *= -1.0f;
     float4 rayStart = mul(float4(ncdXY, 0.0f, 1.0f), RayTraceCB.InvViewProjection);
     float4 rayEnd = mul(float4(ncdXY, 1.0f, 1.0f), RayTraceCB.InvViewProjection);
@@ -153,6 +164,7 @@ void RaygenShader()
     }
 
     RenderTarget[pixelCoord] = float4(newValue, 1.0f);
+    }
 }
 
 static float3 PathTrace(in MeshVertex hitSurface, in Material material, in PrimaryPayload inPayload)

@@ -27,6 +27,7 @@ extern bool g_persistent_shadow_workers;
 extern int g_persistent_worker_groups;
 extern int g_persistent_batch_waves;
 extern int g_wavefront_thread_group_size;
+extern void ApplyPreset(int preset);
 
 namespace SampleFramework12
 {
@@ -871,6 +872,17 @@ void SettingsContainer::Update(uint32 displayWidth, uint32 displayHeight, const 
       ImGui::SameLine();
       ImGui::Checkbox("Use SER", &g_use_ser);
     }
+
+    ImGui::Text("Preset");
+    for (uint32_t i = 0; i < 12; i++) {
+      ImGui::SameLine();
+      char buf[32];
+      snprintf(buf, sizeof(buf), "%d##PRESET%d", (i + 1), (i + 1));
+      if (ImGui::Button(buf)) {
+        ApplyPreset(int(i + 1));
+      }
+    }
+
     ImGui::Checkbox("Wavefront Hit Sort", &g_wavefront_reorder);
     ImGui::Checkbox("Skip Primary Hit Sort", &g_wavefront_skip_primary_sort);
     ImGui::Checkbox("Thread Block Hit Sort", &g_wavefront_block_sort);
@@ -930,6 +942,7 @@ void SettingsContainer::Update(uint32 displayWidth, uint32 displayHeight, const 
     }
     ImGui::SliderInt("Persistent Batch Waves", &g_persistent_batch_waves, 1, 8);
     ImGui::RadioButton("DXR1.0 (original)", &g_render_path, 0);
+    ImGui::RadioButton("DXR1.0 (Persistent Warp)", &g_render_path, 11);
     ImGui::RadioButton("DXR1.0 (recursion, SER)", &g_render_path, 1);
     ImGui::RadioButton("DXR1.0 (loop, SER)", &g_render_path, 2);
     ImGui::RadioButton("DXR1.0 (loop, my)", &g_render_path, 3);
