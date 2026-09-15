@@ -374,7 +374,17 @@ static double CurrentScanDispatchTime(const Array<ProfileData>& profiles, uint64
                                       const uint64* frameQueryData, uint64 gpuFrequency)
 {
     double time = CurrentFrameProfileTimeByName(profiles, numProfiles, frameQueryData, gpuFrequency,
+                                                "RayQuery Persistent Warps (RayGen)");
+    if(time > 0.0)
+        return time;
+
+    time = CurrentFrameProfileTimeByName(profiles, numProfiles, frameQueryData, gpuFrequency,
                                                 "RayQuery Persistent Warps Dispatch");
+    if(time > 0.0)
+        return time;
+
+    time = CurrentFrameProfileTimeByName(profiles, numProfiles, frameQueryData, gpuFrequency,
+                                         "TraceRay DispatchRays (DXR 1.0 Persistent Warp)");
     if(time > 0.0)
         return time;
 
