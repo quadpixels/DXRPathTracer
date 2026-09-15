@@ -86,11 +86,13 @@ protected:
     ID3D12StateObject* rtPSO_SER = nullptr;
     ID3D12StateObject* rtPSOLoop_SER = nullptr;
     ID3D12StateObject* rtPSOLoop_my = nullptr;
+    ID3D12StateObject* rtRayQueryPersistentPSO = nullptr;
     bool buildAccelStructure = true;
     uint64 lastBuildAccelStructureFrame = uint64(-1);
     RawBuffer rtBottomLevelAccelStructure;
     RawBuffer rtTopLevelAccelStructure;
     StructuredBuffer rtRayGenTable, rtRayGenTable_SER, rtRayGenTableLoop_SER, rtRayGenTableLoop_my;
+    StructuredBuffer rtRayQueryPersistentRayGenTable;
     StructuredBuffer rtHitTable, rtHitTable_SER, rtHitTableLoop_SER, rtHitTableLoop_my;
     StructuredBuffer rtMissTable, rtMissTable_SER, rtMissTableLoop_SER, rtMissTableLoop_my;
     StructuredBuffer rtGeoInfoBuffer;
@@ -102,6 +104,7 @@ protected:
     CompiledShaderPtr rayTraceRayQueryCS;
     ID3D12PipelineState* rtRayQueryPSO{};
     CompiledShaderPtr rayTraceRayQuery1CS;
+    CompiledShaderPtr rayTraceRayQueryPersistentLib;
     ID3D12PipelineState* rtRayQuery1PSO{};
     CompiledShaderPtr wavefrontClearCS;
     CompiledShaderPtr wavefrontGeneratePrimaryCS;
@@ -184,6 +187,7 @@ protected:
     void CreateRayTracingPSOs(const CompiledShaderPtr& shader_ptr, ID3D12StateObject** rtpso,
       StructuredBuffer* raygen_table, StructuredBuffer* hit_table, StructuredBuffer* miss_table);
     void CreateRayTracingRayQueryPSOs();
+    void CreateRayQueryPersistentRayGenPSO();
 
     void UpdateLights();
 

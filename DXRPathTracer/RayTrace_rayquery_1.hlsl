@@ -452,15 +452,8 @@ static void ShadeSurfaceAndSampleNext(
 // -------------------------------------------------------------------------------------------------
 // now does full path loop using RayQuery
 // -------------------------------------------------------------------------------------------------
-[numthreads(8, 8, 1)]
-void main(uint3 dispatchThreadID : SV_DispatchThreadID)
+static float3 TracePixelPath_RQ(uint2 pixelCoord, uint width, uint height, uint pixelIdx)
 {
-    int width;
-    int height;
-    RenderTarget.GetDimensions(width, height);
-    const uint2 pixelCoord = dispatchThreadID.xy;
-    const uint pixelIdx = pixelCoord.y * width + pixelCoord.x;
-
     uint sampleSetIdx = 0;
 
     // Primary ray (same as original)
@@ -583,7 +576,12 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
 
     radiance = clamp(radiance, 0.0f, FP16Max);
 
-    // Progressive accumulation (same as original)
+    return radiance;
+}
+
+static void AccumulatePixel_RQ(uint2 pixelCoord, float3 radiance)
+{
+    radiance = clamp(radiance, 0.0f, FP16Max);
     const float lerpFactor = RayTraceCB.CurrSampleIdx / (RayTraceCB.CurrSampleIdx + 1.0f);
     float3 newSample = radiance;
     float3 currValue = RenderTarget[pixelCoord].xyz;
@@ -591,3 +589,39 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
 
     RenderTarget[pixelCoord] = float4(newValue, 1.0f);
 }
+
+#ifndef RAYGEN_QUERY_PERSISTENT
+[numthreads(8, 8, 1)]
+void main(uint3 dispatchThreadID : SV_DispatchThreadID)
+{
+    uint width;
+    uint height;
+    RenderTarget.GetDimensions(width, height);
+    const uint2 pixelCoord = dispatchThreadID.xy;
+    if(pixelCoord.x >= width || pixelCoord.y >= height)
+        return;
+
+    const uint pixelIdx = pixelCoord.y * width + pixelCoord.x;
+    AccumulatePixel_RQ(pixelCoord, TracePixelPath_RQ(pixelCoord, width, height, pixelIdx));
+}
+#else
+[shader("raygeneration")]
+void RaygenRayQueryPersistent()
+{
+    uint width;
+    uint height;
+    RenderTarget.GetDimensions(width, height);
+
+    const uint3 dispatchIndex = DispatchRaysIndex();
+    const uint2 dispatchDimensions = DispatchRaysDimensions().xy;
+    const uint firstWorkerIndex = dispatchIndex.y * dispatchDimensions.x + dispatchIndex.x;
+    const uint workerStride = dispatchDimensions.x * dispatchDimensions.y;
+
+    for(uint pixelIdx = firstWorkerIndex; pixelIdx < RayTraceCB.TotalNumPixels; pixelIdx += workerStride)
+    {
+        const uint2 pixelCoord = uint2(pixelIdx % width, pixelIdx / width);
+        const float3 radiance = TracePixelPath_RQ(pixelCoord, width, height, pixelIdx);
+        AccumulatePixel_RQ(pixelCoord, radiance);
+    }
+}
+#endif

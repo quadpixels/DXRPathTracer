@@ -953,6 +953,7 @@ void SettingsContainer::Update(uint32 displayWidth, uint32 displayHeight, const 
     ImGui::RadioButton("DXR1.1 (Persistent Warps)", &g_render_path, 8);
     ImGui::RadioButton("DXR1.1 (GPU Wavefront)", &g_render_path, 9);
     ImGui::RadioButton("DXR1.1 (Persistent Wavefront, global queue)", &g_render_path, 10);
+    ImGui::RadioButton("DXR1.0+1.1 (RayQuery Persistent Warps, RayGen)", &g_render_path, 12);
 
     for(uint64 groupIdx = 0; groupIdx < groups.Count(); ++groupIdx)
     {

@@ -537,6 +537,7 @@ void DXRPathTracer::Shutdown()
     rtBottomLevelAccelStructure.Shutdown();
     rtTopLevelAccelStructure.Shutdown();
     rtRayGenTable.Shutdown();
+    rtRayQueryPersistentRayGenTable.Shutdown();
     rtHitTable.Shutdown();
     rtMissTable.Shutdown();
     rtGeoInfoBuffer.Shutdown();
@@ -634,6 +635,7 @@ void DXRPathTracer::CreatePSOs()
     CreateRayTracingPSOs(rayTraceLibLoop_my, &rtPSOLoop_my, &rtRayGenTableLoop_my, &rtHitTableLoop_my, &rtMissTableLoop_my);
     // DXR 1.1 PSOs, 2 in total
     CreateRayTracingRayQueryPSOs();
+    CreateRayQueryPersistentRayGenPSO();
 }
 
 void DXRPathTracer::DestroyPSOs()
@@ -650,6 +652,7 @@ void DXRPathTracer::DestroyPSOs()
     DX12::DeferredRelease(rtPSO_SER);
     DX12::DeferredRelease(rtPSOLoop_SER);
     DX12::DeferredRelease(rtPSOLoop_my);
+    DX12::DeferredRelease(rtRayQueryPersistentPSO);
     DX12::DeferredRelease(rtRayQueryPSO);
     DX12::DeferredRelease(rtRayQuery1PSO);
     DX12::DeferredRelease(wavefrontClearPSO);
@@ -981,6 +984,9 @@ void DXRPathTracer::InitRayTracing()
     // RayQuery ver
     rayTraceRayQueryCS = CompileFromFile(L"RayTrace_rayquery.hlsl", nullptr, ShaderType::Compute, co);
     rayTraceRayQuery1CS = CompileFromFile(L"RayTrace_rayquery_1.hlsl", nullptr, ShaderType::Compute, co);
+    CompileOptions persistentRayGenOptions = co;
+    persistentRayGenOptions.Add("RAYGEN_QUERY_PERSISTENT", 1);
+    rayTraceRayQueryPersistentLib = CompileFromFile(L"RayTrace_rayquery_1.hlsl", nullptr, ShaderType::Library, persistentRayGenOptions);
     wavefrontClearCS = CompileFromFile(L"WavefrontPathTrace.hlsl", "WavefrontClearCS", ShaderType::Compute, co);
     wavefrontGeneratePrimaryCS = CompileFromFile(L"WavefrontPathTrace.hlsl", "WavefrontGeneratePrimaryCS", ShaderType::Compute, co);
     wavefrontTraceHitsCS = CompileFromFile(L"WavefrontPathTrace.hlsl", "WavefrontTraceHitsCS", ShaderType::Compute, co);
@@ -1256,6 +1262,47 @@ void DXRPathTracer::CreateRayTracingRayQueryPSOs() {
         DXCall(DX12::Device->CreateComputePipelineState(&cpsd, IID_PPV_ARGS(&wavefrontScatterReorderedRaysPSOVariants[variantIdx])));
     }
   }
+}
+
+void DXRPathTracer::CreateRayQueryPersistentRayGenPSO()
+{
+    StateObjectBuilder builder;
+    builder.Init(4);
+
+    D3D12_DXIL_LIBRARY_DESC libraryDesc = { };
+    libraryDesc.DXILLibrary = rayTraceRayQueryPersistentLib.ByteCode();
+    builder.AddSubObject(libraryDesc);
+
+    D3D12_RAYTRACING_SHADER_CONFIG shaderConfig = { };
+    shaderConfig.MaxAttributeSizeInBytes = 2 * sizeof(float);
+    shaderConfig.MaxPayloadSizeInBytes = 0;
+    builder.AddSubObject(shaderConfig);
+
+    D3D12_GLOBAL_ROOT_SIGNATURE globalRootSignature = { };
+    globalRootSignature.pGlobalRootSignature = rtRootSignature;
+    builder.AddSubObject(globalRootSignature);
+
+    D3D12_RAYTRACING_PIPELINE_CONFIG pipelineConfig = { };
+    pipelineConfig.MaxTraceRecursionDepth = 1;
+    builder.AddSubObject(pipelineConfig);
+
+    rtRayQueryPersistentPSO = builder.CreateStateObject(D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE);
+
+    ID3D12StateObjectProperties* properties = nullptr;
+    DXCall(rtRayQueryPersistentPSO->QueryInterface(IID_PPV_ARGS(&properties)));
+    const void* rayGenID = properties->GetShaderIdentifier(L"RaygenRayQueryPersistent");
+    Assert_(rayGenID != nullptr);
+
+    ShaderIdentifier rayGenRecord(rayGenID);
+    StructuredBufferInit sbInit;
+    sbInit.Stride = sizeof(ShaderIdentifier);
+    sbInit.NumElements = 1;
+    sbInit.InitData = &rayGenRecord;
+    sbInit.ShaderTable = true;
+    sbInit.Name = L"RayQuery Persistent Ray Gen Shader Table";
+    rtRayQueryPersistentRayGenTable.Initialize(sbInit);
+
+    DX12::Release(properties);
 }
 
 void DXRPathTracer::Update(const Timer& timer)
@@ -1823,6 +1870,8 @@ void DXRPathTracer::RenderRayTracing()
         activeRenderPath = 5;
     else if(activeRenderPath == 10 && wavefrontPersistentWorkQueuePSOVariants[wavefrontVariantIdx] == nullptr)
         activeRenderPath = 7;
+    else if(activeRenderPath == 12 && rtRayQueryPersistentPSO == nullptr)
+        activeRenderPath = 5;
 
     switch (activeRenderPath) {
     case 0: {
@@ -1845,6 +1894,17 @@ void DXRPathTracer::RenderRayTracing()
       dispatchDesc.HitGroupTable = rtHitTable.ShaderTable();
       dispatchDesc.MissShaderTable = rtMissTable.ShaderTable();
       dispatchDesc.RayGenerationShaderRecord = rtRayGenTable.ShaderRecord(0);
+      dispatchDesc.Width = ActiveWavefrontThreadGroupSize();
+      dispatchDesc.Height = uint32(Max<int>(g_persistent_worker_groups, 1));
+      dispatchDesc.Depth = 1;
+      DX12::CmdList->DispatchRays(&dispatchDesc);
+      break;
+    }
+    case 12: {
+      ProfileBlock pb(cmdList, "RayQuery Persistent Warps (RayGen)");
+      cmdList->SetPipelineState1(rtRayQueryPersistentPSO);
+      D3D12_DISPATCH_RAYS_DESC dispatchDesc = {};
+      dispatchDesc.RayGenerationShaderRecord = rtRayQueryPersistentRayGenTable.ShaderRecord(0);
       dispatchDesc.Width = ActiveWavefrontThreadGroupSize();
       dispatchDesc.Height = uint32(Max<int>(g_persistent_worker_groups, 1));
       dispatchDesc.Depth = 1;
