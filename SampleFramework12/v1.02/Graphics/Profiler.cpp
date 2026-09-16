@@ -24,6 +24,7 @@ extern bool g_wavefront_skip_primary_sort;
 extern bool g_wavefront_block_sort;
 extern bool g_wavefront_wave_append;
 extern bool g_persistent_shadow_workers;
+extern int g_render_path;
 extern int g_persistent_worker_groups;
 extern int g_persistent_batch_waves;
 extern int g_wavefront_thread_group_size;
@@ -326,6 +327,23 @@ static const uint32 ThreadGroupScanWarmupFrames = 50;
 static const float  ThreadGroupScanWarmupSeconds = 5;  // Whichever comes first
 static const uint32 ThreadGroupScanSampleFrames = 20;
 
+struct CurrentConfigMeasureState
+{
+    bool Active = false;
+    bool Finished = false;
+    uint32 WarmupFrames = 0;
+    uint32 SampleFrames = 0;
+    double SampleSum = 0.0;
+    double WarmupStartTime = 0.0;
+    double WarmupElapsedTime = 0.0;
+    int RenderPath = 0;
+    int ThreadGroupSize = 64;
+    int WorkerGroups = 1024;
+    string Results;
+};
+
+static CurrentConfigMeasureState CurrentConfigMeasure;
+
 static double CurrentSecondsSinceEpoch() {
   auto now = std::chrono::system_clock::now();
   // Get duration since epoch in milliseconds
@@ -370,6 +388,62 @@ static void CancelThreadGroupScan()
     g_persistent_worker_groups = ThreadGroupScan.SavedWorkerGroups;
 }
 
+static const char* CurrentRenderPathProfileName(int renderPath)
+{
+    static const char* profileNames[] =
+    {
+        "TraceRay DispatchRays (original, recursive)",
+        "TraceRay DispatchRays (recursive, SER)",
+        "TraceRay DispatchRays (loop, SER)",
+        "TraceRay DispatchRays (loop, my)",
+        "RayQuery Dispatch (template)",
+        "RayQuery Dispatch (loop)",
+        "RayQuery Wavefront Dispatch",
+        "RayQuery Persistent Wavefront Dispatch",
+        "RayQuery Persistent Warps Dispatch",
+        "RayQuery GPU Wavefront Dispatch",
+        "RayQuery Persistent Wavefront Global Queue Dispatch",
+        "TraceRay DispatchRays (DXR 1.0 Persistent Warp)",
+        "RayQuery Persistent Warps (RayGen)",
+    };
+
+    if(renderPath < 0 || renderPath >= int(ArraySize_(profileNames)))
+        return nullptr;
+    return profileNames[renderPath];
+}
+
+static void BeginCurrentConfigMeasure()
+{
+    CurrentConfigMeasure = CurrentConfigMeasureState();
+    CurrentConfigMeasure.Active = true;
+    CurrentConfigMeasure.RenderPath = g_render_path;
+    CurrentConfigMeasure.ThreadGroupSize = g_wavefront_thread_group_size;
+    CurrentConfigMeasure.WorkerGroups = g_persistent_worker_groups;
+    CurrentConfigMeasure.WarmupStartTime = CurrentSecondsSinceEpoch();
+}
+
+static void CancelCurrentConfigMeasure()
+{
+    CurrentConfigMeasure.Active = false;
+    CurrentConfigMeasure.Results = "Current config measurement cancelled because the render path or worker configuration changed.\r\n";
+    OutputDebugStringA(CurrentConfigMeasure.Results.c_str());
+}
+
+static void FinishCurrentConfigMeasure()
+{
+    CurrentConfigMeasure.Active = false;
+    CurrentConfigMeasure.Finished = true;
+    const double averageTime = CurrentConfigMeasure.SampleSum / double(CurrentConfigMeasure.SampleFrames);
+    char result[256] = { };
+    sprintf_s(result,
+              "Current Config Measurement\r\nrender_path_id,tg_size,num_tg,samples,dispatch_time_ms\r\n%d,%d,%d,%u,%.4f\r\n",
+              CurrentConfigMeasure.RenderPath, CurrentConfigMeasure.ThreadGroupSize,
+              CurrentConfigMeasure.WorkerGroups, CurrentConfigMeasure.SampleFrames, averageTime);
+    CurrentConfigMeasure.Results = result;
+    OutputDebugStringA(CurrentConfigMeasure.Results.c_str());
+    WriteLog("%s", CurrentConfigMeasure.Results.c_str());
+}
+
 static double CurrentScanDispatchTime(const Array<ProfileData>& profiles, uint64 numProfiles,
                                       const uint64* frameQueryData, uint64 gpuFrequency)
 {
@@ -405,6 +479,65 @@ static double CurrentScanDispatchTime(const Array<ProfileData>& profiles, uint64
 
     return CurrentFrameProfileTimeByName(profiles, numProfiles, frameQueryData, gpuFrequency,
                                          "RayQuery Wavefront Dispatch");
+}
+
+static double CurrentConfigDispatchTime(const Array<ProfileData>& profiles, uint64 numProfiles,
+                                        const uint64* frameQueryData, uint64 gpuFrequency)
+{
+    const char* profileName = CurrentRenderPathProfileName(CurrentConfigMeasure.RenderPath);
+    if(profileName == nullptr)
+        return 0.0;
+
+    double time = CurrentFrameProfileTimeByName(profiles, numProfiles, frameQueryData, gpuFrequency, profileName);
+    if(time > 0.0)
+        return time;
+
+    for(int renderPath = 0; renderPath <= 12; ++renderPath)
+    {
+        if(renderPath == CurrentConfigMeasure.RenderPath)
+            continue;
+
+        const char* fallbackName = CurrentRenderPathProfileName(renderPath);
+        time = CurrentFrameProfileTimeByName(profiles, numProfiles, frameQueryData, gpuFrequency, fallbackName);
+        if(time > 0.0)
+            return time;
+    }
+
+    return 0.0;
+}
+
+static void UpdateCurrentConfigMeasure(const Array<ProfileData>& profiles, uint64 numProfiles,
+                                       const uint64* frameQueryData, uint64 gpuFrequency)
+{
+    if(CurrentConfigMeasure.Active == false)
+        return;
+
+    if(g_render_path != CurrentConfigMeasure.RenderPath ||
+       g_wavefront_thread_group_size != CurrentConfigMeasure.ThreadGroupSize ||
+       g_persistent_worker_groups != CurrentConfigMeasure.WorkerGroups)
+    {
+        CancelCurrentConfigMeasure();
+        return;
+    }
+
+    const double seconds = CurrentSecondsSinceEpoch();
+    CurrentConfigMeasure.WarmupElapsedTime = seconds - CurrentConfigMeasure.WarmupStartTime;
+    const bool warmupComplete = CurrentConfigMeasure.WarmupFrames >= ThreadGroupScanWarmupFrames ||
+                                CurrentConfigMeasure.WarmupElapsedTime > ThreadGroupScanWarmupSeconds;
+    if(warmupComplete == false)
+    {
+        ++CurrentConfigMeasure.WarmupFrames;
+        return;
+    }
+
+    const double frameTime = CurrentConfigDispatchTime(profiles, numProfiles, frameQueryData, gpuFrequency);
+    if(frameTime <= 0.0)
+        return;
+
+    CurrentConfigMeasure.SampleSum += frameTime;
+    ++CurrentConfigMeasure.SampleFrames;
+    if(CurrentConfigMeasure.SampleFrames >= ThreadGroupScanSampleFrames)
+        FinishCurrentConfigMeasure();
 }
 
 static void UpdateThreadGroupScan(const Array<ProfileData>& profiles, uint64 numProfiles,
@@ -726,6 +859,7 @@ void Profiler::EndFrame(uint32 displayWidth, uint32 displayHeight)
     }
 
     UpdateThreadGroupScan(profiles, numProfiles, frameQueryData, gpuFrequency);
+    UpdateCurrentConfigMeasure(profiles, numProfiles, frameQueryData, gpuFrequency);
 
     // Iterate over all of the profiles
     for(uint64 profileIdx = 0; profileIdx < numProfiles; ++profileIdx)
@@ -767,10 +901,29 @@ void Profiler::EndFrame(uint32 displayWidth, uint32 displayHeight)
             if(ImGui::Button("Cancel Thread Group Scan"))
                 CancelThreadGroupScan();
         }
+        else if(CurrentConfigMeasure.Active)
+        {
+            ImGui::Text("Current config measurement: mode=%d tg=%d num_tg=%d warmup=%u/%ufr, %.1f/%.1fs samples=%u/%u",
+                        CurrentConfigMeasure.RenderPath,
+                        CurrentConfigMeasure.ThreadGroupSize,
+                        CurrentConfigMeasure.WorkerGroups,
+                        CurrentConfigMeasure.WarmupFrames,
+                        ThreadGroupScanWarmupFrames,
+                        CurrentConfigMeasure.WarmupElapsedTime,
+                        ThreadGroupScanWarmupSeconds,
+                        CurrentConfigMeasure.SampleFrames,
+                        ThreadGroupScanSampleFrames);
+            if(ImGui::Button("Cancel Current Config Measurement"))
+                CancelCurrentConfigMeasure();
+        }
         else
         {
             if(ImGui::Button("Scan Thread Groups"))
                 BeginThreadGroupScan();
+
+            ImGui::SameLine();
+            if(ImGui::Button("Measure Current Config (20 samples)"))
+                BeginCurrentConfigMeasure();
 
             if(ThreadGroupScan.Finished)
             {
@@ -792,6 +945,20 @@ void Profiler::EndFrame(uint32 displayWidth, uint32 displayHeight)
                                       ImVec2(-1.0f, ImGui::GetTextLineHeight() * 12.0f),
                                       ImGuiInputTextFlags_ReadOnly);
         }
+
+        if(CurrentConfigMeasure.Results.empty() == false)
+        {
+            ImGui::Text("Current Config Measurement Result");
+            ImGui::SameLine();
+            if(ImGui::Button("Copy Current Config Result"))
+                ImGui::SetClipboardText(CurrentConfigMeasure.Results.c_str());
+
+            ImGui::InputTextMultiline("##CurrentConfigMeasureResults",
+                                      const_cast<char*>(CurrentConfigMeasure.Results.c_str()),
+                                      CurrentConfigMeasure.Results.size() + 1,
+                                      ImVec2(-1.0f, ImGui::GetTextLineHeight() * 3.0f),
+                                      ImGuiInputTextFlags_ReadOnly);
+        }
     }
     else
         logToClipboard = false;
@@ -801,7 +968,7 @@ void Profiler::EndFrame(uint32 displayWidth, uint32 displayHeight)
     if(enableGPUProfiling)
         readbackBuffer.Unmap();
 
-    enableGPUProfiling = showUI || ThreadGroupScan.Active;
+    enableGPUProfiling = showUI || ThreadGroupScan.Active || CurrentConfigMeasure.Active;
 }
 
 double Profiler::GPUProfileTiming(const char* name) const

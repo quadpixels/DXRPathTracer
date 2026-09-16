@@ -1852,7 +1852,7 @@ void DXRPathTracer::RenderRayTracing()
     int activeRenderPath = g_render_path;
     if(activeRenderPath == 1 && rtPSO_SER == nullptr)
         activeRenderPath = 0;
-    else if(activeRenderPath == 2 && rtPSOLoop_SER == nullptr)
+    uelse if(activeRenderPath == 2 && rtPSOLoop_SER == nullptr)
         activeRenderPath = rtPSOLoop_my != nullptr ? 3 : 0;
     else if(activeRenderPath == 3 && rtPSOLoop_my == nullptr)
         activeRenderPath = 0;
