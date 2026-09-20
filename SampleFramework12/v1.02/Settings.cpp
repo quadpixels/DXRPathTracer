@@ -874,7 +874,7 @@ void SettingsContainer::Update(uint32 displayWidth, uint32 displayHeight, const 
     }
 
     ImGui::Text("Preset");
-    for (uint32_t i = 0; i < 18; i++) {
+    for (uint32_t i = 0; i < 21; i++) {
       if (i + 1 != 13) {
         ImGui::SameLine();
       }

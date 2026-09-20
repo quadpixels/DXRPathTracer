@@ -72,24 +72,24 @@ static int g_commandLinePreset = 0;
 
 void ApplyPreset(int preset)
 {
-  if (preset < 1 || preset > 18)
+  if (preset < 1 || preset > 21)
     return;
 
-  if (preset >= 13 && preset <= 18) {
-    // (DXR1.1 loop, DXR1.0 persistent warps) * 3
-    const int idx = (preset - 13) % 2;
-    const int config = (preset - 13) / 2;
-    static const int renderPaths[] = { 5, 11 };
+  if (preset >= 13 && preset <= 21) {
+    // (DXR1.1 loop, DXR1.0 persistent warps, DXR1.0+1.1 RayQuery persistent warps) * 3
+    const int mode = (preset - 13) % 3;
+    const int config = (preset - 13) / 3;
+    static const int renderPaths[] = { 5, 11, 12 };
     static const int pathLengths[] = { 3, 8, 8 };
     static const int anyHitPathLengths[] = { 1, 1, 8 };
 
     AppSettings::CurrentScene.SetValue(Scenes::SunTemple);
     AppSettings::StablePowerState.SetValue(true);
     AppSettings::AlwaysResetPathTrace.SetValue(true);
-    g_render_path = renderPaths[idx];
+    g_render_path = renderPaths[mode];
     AppSettings::MaxPathLength.SetValue(pathLengths[config]);
     AppSettings::MaxAnyHitPathLength.SetValue(anyHitPathLengths[config]);
-    if ((preset & 1) == 0) {
+    if (g_render_path == 11) {
       g_wavefront_thread_group_size = 512;
       g_persistent_worker_groups = 512;
     }
@@ -2841,7 +2841,7 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
                 ++commandLine;
             wchar* end = nullptr;
             long value = wcstol(commandLine, &end, 10);
-            if(end != commandLine && value >= 1 && value <= 18)
+            if(end != commandLine && value >= 1 && value <= 21)
                 g_commandLinePreset = int(value);
             break;
         }
