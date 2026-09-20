@@ -89,6 +89,10 @@ void ApplyPreset(int preset)
     g_render_path = renderPaths[idx];
     AppSettings::MaxPathLength.SetValue(pathLengths[config]);
     AppSettings::MaxAnyHitPathLength.SetValue(anyHitPathLengths[config]);
+    if ((preset & 1) == 0) {
+      g_wavefront_thread_group_size = 512;
+      g_persistent_worker_groups = 512;
+    }
   }
   else if (preset >= 1 && preset <= 12) {
 

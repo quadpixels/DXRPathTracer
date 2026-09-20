@@ -875,7 +875,9 @@ void SettingsContainer::Update(uint32 displayWidth, uint32 displayHeight, const 
 
     ImGui::Text("Preset");
     for (uint32_t i = 0; i < 18; i++) {
-      ImGui::SameLine();
+      if (i + 1 != 13) {
+        ImGui::SameLine();
+      }
       char buf[32];
       snprintf(buf, sizeof(buf), "%d##PRESET%d", (i + 1), (i + 1));
       if (ImGui::Button(buf)) {
