@@ -66,7 +66,7 @@ StaticAssert_(ArraySize_(SceneCameraPositions) == uint64(Scenes::NumValues));
 StaticAssert_(ArraySize_(SceneCameraRotations) == uint64(Scenes::NumValues));
 StaticAssert_(ArraySize_(SceneSunDirections) == uint64(Scenes::NumValues));
 
-int g_render_path = 0;  // 0=DXR1.0 original, 1=DXR1.0 SER, 2=DXR1.0 loop SER, 3=DXR1.0 loop my, 4=DXR1.1 recursion, 5=DXR1.1 loop, 6=DXR1.1 wavefront, 7=DXR1.1 persistent wavefront, 8=DXR1.1 persistent warps, 9=DXR1.1 GPU wavefront, 10=DXR1.1 persistent wavefront global queue
+int g_render_path = 0;  // 0=DXR1.0 original, 1=DXR1.0 SER, 2=DXR1.0 loop SER, 3=DXR1.0 loop my, 4=DXR1.1 recursion, 5=DXR1.1 loop, 6=DXR1.1 wavefront, 7=DXR1.1 persistent wavefront, 8=DXR1.1 persistent warps, 9=DXR1.1 GPU wavefront, 10=DXR1.1 persistent wavefront global queue, 11=DXR1.0 persistent warp, 12=DXR1.0+1.1 RayQuery persistent warp, 13=DXR1.0 tiled persistent warp
 int g_wavefront_thread_group_size = 64;
 static int g_commandLinePreset = 0;
 
@@ -1839,6 +1839,9 @@ void DXRPathTracer::RenderRayTracing()
     if (g_wavefront_wave_append) {
       rtConstants.myFlags |= 8;
     }
+    if (g_render_path == 13) {
+      rtConstants.myFlags |= 16;
+    }
 
     DX12::BindTempConstantBuffer(cmdList, rtConstants, RTParams_CBuffer, CmdListMode::Compute);
 
@@ -1911,6 +1914,19 @@ void DXRPathTracer::RenderRayTracing()
     }
     case 11: {
       ProfileBlock pb(cmdList, "TraceRay DispatchRays (DXR 1.0 Persistent Warp)");
+      cmdList->SetPipelineState1(rtPSO);
+      D3D12_DISPATCH_RAYS_DESC dispatchDesc = {};
+      dispatchDesc.HitGroupTable = rtHitTable.ShaderTable();
+      dispatchDesc.MissShaderTable = rtMissTable.ShaderTable();
+      dispatchDesc.RayGenerationShaderRecord = rtRayGenTable.ShaderRecord(0);
+      dispatchDesc.Width = ActiveWavefrontThreadGroupSize();
+      dispatchDesc.Height = uint32(Max<int>(g_persistent_worker_groups, 1));
+      dispatchDesc.Depth = 1;
+      DX12::CmdList->DispatchRays(&dispatchDesc);
+      break;
+    }
+    case 13: {
+      ProfileBlock pb(cmdList, "TraceRay DispatchRays (DXR 1.0 Tiled Persistent Warp)");
       cmdList->SetPipelineState1(rtPSO);
       D3D12_DISPATCH_RAYS_DESC dispatchDesc = {};
       dispatchDesc.HitGroupTable = rtHitTable.ShaderTable();

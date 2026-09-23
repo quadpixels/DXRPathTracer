@@ -103,12 +103,37 @@ static float2 SamplePoint(in uint pixelIdx, inout uint setIdx)
 void RaygenShader()
 {
     const uint3 dispatchIndex = DispatchRaysIndex();
-    const uint dispatchIdx = dispatchIndex.y * DispatchRaysDimensions().x + dispatchIndex.x;
-    const uint dispatchStride = DispatchRaysDimensions().x * DispatchRaysDimensions().y;
+    const uint dispatchWidth = DispatchRaysDimensions().x;
+    const uint dispatchHeight = DispatchRaysDimensions().y;
+    const uint dispatchIdx = dispatchIndex.y * dispatchWidth + dispatchIndex.x;
+    const uint dispatchStride = dispatchWidth * dispatchHeight;
+    const bool tiledPersistentWarp = (RayTraceCB.myFlags & 16u) != 0u;
+    const uint tileCountX = (RayTraceCB.DispatchWidth + dispatchWidth - 1u) / dispatchWidth;
+    const uint tileCountY = (RayTraceCB.DispatchHeight + dispatchHeight - 1u) / dispatchHeight;
+    const uint workItemCount = tiledPersistentWarp ? tileCountX * tileCountY :
+                               (RayTraceCB.TotalNumPixels + dispatchStride - 1u) / dispatchStride;
 
-    for(uint pixelIdx = dispatchIdx; pixelIdx < RayTraceCB.TotalNumPixels; pixelIdx += dispatchStride)
+    for(uint workItem = 0; workItem < workItemCount; ++workItem)
     {
-    const uint2 pixelCoord = uint2(pixelIdx % RayTraceCB.DispatchWidth, pixelIdx / RayTraceCB.DispatchWidth);
+    uint pixelIdx;
+    uint2 pixelCoord;
+    if(tiledPersistentWarp)
+    {
+        const uint tileX = workItem % tileCountX;
+        const uint tileY = workItem / tileCountX;
+        pixelCoord = dispatchIndex.xy + uint2(tileX * dispatchWidth, tileY * dispatchHeight);
+        if(pixelCoord.x >= RayTraceCB.DispatchWidth || pixelCoord.y >= RayTraceCB.DispatchHeight)
+            continue;
+        pixelIdx = pixelCoord.y * RayTraceCB.DispatchWidth + pixelCoord.x;
+    }
+    else
+    {
+        pixelIdx = dispatchIdx + workItem * dispatchStride;
+        if(pixelIdx >= RayTraceCB.TotalNumPixels)
+            break;
+        pixelCoord = uint2(pixelIdx % RayTraceCB.DispatchWidth, pixelIdx / RayTraceCB.DispatchWidth);
+    }
+
     uint sampleSetIdx = 0;
 
     // Form a primary ray by un-projecting the pixel coordinate using the inverse view * projection matrix

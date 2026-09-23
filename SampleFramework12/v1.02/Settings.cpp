@@ -945,6 +945,7 @@ void SettingsContainer::Update(uint32 displayWidth, uint32 displayHeight, const 
     ImGui::SliderInt("Persistent Batch Waves", &g_persistent_batch_waves, 1, 8);
     ImGui::RadioButton("DXR1.0 (original)", &g_render_path, 0);
     ImGui::RadioButton("DXR1.0 (Persistent Warp)", &g_render_path, 11);
+    ImGui::RadioButton("DXR1.0 (Tiled Persistent Warp)", &g_render_path, 13);
     ImGui::RadioButton("DXR1.0 (recursion, SER)", &g_render_path, 1);
     ImGui::RadioButton("DXR1.0 (loop, SER)", &g_render_path, 2);
     ImGui::RadioButton("DXR1.0 (loop, my)", &g_render_path, 3);
