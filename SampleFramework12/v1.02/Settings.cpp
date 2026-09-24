@@ -25,6 +25,7 @@ extern bool g_wavefront_wave_append;
 extern bool g_wavefront_use_clear_uav;
 extern bool g_persistent_shadow_workers;
 extern int g_persistent_worker_groups;
+extern int g_persistent_worker_groups_actual;
 extern int g_persistent_batch_waves;
 extern int g_wavefront_thread_group_size;
 extern void ApplyPreset(int preset);
@@ -941,11 +942,18 @@ void SettingsContainer::Update(uint32 displayWidth, uint32 displayHeight, const 
 
         if(ImGui::Button("Apply Persistent Worker Groups"))
             g_persistent_worker_groups = pendingWorkerGroups;
+
+        if(g_persistent_worker_groups_actual > 0)
+            ImGui::Text("Actual Persistent Worker Groups: %d", g_persistent_worker_groups_actual);
+        else
+            ImGui::Text("Actual Persistent Worker Groups: inactive");
     }
     ImGui::SliderInt("Persistent Batch Waves", &g_persistent_batch_waves, 1, 8);
     ImGui::RadioButton("DXR1.0 (original)", &g_render_path, 0);
     ImGui::RadioButton("DXR1.0 (Persistent Warp)", &g_render_path, 11);
     ImGui::RadioButton("DXR1.0 (Tiled Persistent Warp)", &g_render_path, 13);
+    ImGui::RadioButton("DXR1.0 (Persistent Warp, Atomic)", &g_render_path, 15);
+    ImGui::RadioButton("DXR1.0 (Tiled Persistent Warp, Atomic)", &g_render_path, 16);
     ImGui::RadioButton("DXR1.0 (recursion, SER)", &g_render_path, 1);
     ImGui::RadioButton("DXR1.0 (loop, SER)", &g_render_path, 2);
     ImGui::RadioButton("DXR1.0 (loop, my)", &g_render_path, 3);
@@ -954,6 +962,7 @@ void SettingsContainer::Update(uint32 displayWidth, uint32 displayHeight, const 
     ImGui::RadioButton("DXR1.1 (wavefront queues)", &g_render_path, 6);
     ImGui::RadioButton("DXR1.1 (Persistent Wavefront)", &g_render_path, 7);
     ImGui::RadioButton("DXR1.1 (Persistent Warps)", &g_render_path, 8);
+    ImGui::RadioButton("DXR1.1 (Persistent Warps, Static Stride)", &g_render_path, 14);
     ImGui::RadioButton("DXR1.1 (GPU Wavefront)", &g_render_path, 9);
     ImGui::RadioButton("DXR1.1 (Persistent Wavefront, global queue)", &g_render_path, 10);
     ImGui::RadioButton("DXR1.0+1.1 (RayQuery Persistent Warps, RayGen)", &g_render_path, 12);

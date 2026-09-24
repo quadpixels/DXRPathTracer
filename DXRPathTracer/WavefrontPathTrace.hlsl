@@ -49,6 +49,9 @@ struct RayTraceConstants
     uint WavefrontBounce;
     uint WavefrontPadding;
     uint WavefrontThreadGroupSize;
+    uint DispatchWidth;
+    uint DispatchHeight;
+    uint PersistentWorkerCount;
 };
 
 struct LightConstants
@@ -1224,36 +1227,51 @@ void PersistentWarpsPathTraceCS(uint3 dispatchThreadID : SV_DispatchThreadID)
     int height;
     RenderTarget.GetDimensions(width, height);
 
-    while(true)
+    if((RayTraceCB.myFlags & 32u) != 0u)
     {
-        uint waveBaseIdx = 0;
-        const uint laneIdx = ActiveWaveLaneIndex();
-        const uint waveSize = ActiveWaveLaneCount();
-        const uint batchWaves = max(RayTraceCB.WavefrontPadding, 1u);
-        const uint batchSize = waveSize * batchWaves;
-
-        if(WaveIsFirstLane())
-            InterlockedAdd(WavefrontCounters[Counter_WorkCursor], batchSize, waveBaseIdx);
-
-        waveBaseIdx = WaveReadLaneFirst(waveBaseIdx);
-        const bool batchHasWork = waveBaseIdx < RayTraceCB.TotalNumPixels;
-
-        if(WaveActiveAnyTrue(batchHasWork) == false)
-            break;
-
-        for(uint batchWave = 0; batchWave < batchWaves; ++batchWave)
+        const uint workerCount = max(RayTraceCB.PersistentWorkerCount, 1u);
+        for(uint pixelIdx = dispatchThreadID.x;
+            pixelIdx < RayTraceCB.TotalNumPixels;
+            pixelIdx += workerCount)
         {
-            const uint pixelIdx = waveBaseIdx + batchWave * waveSize + laneIdx;
-            const bool validWork = pixelIdx < RayTraceCB.TotalNumPixels;
+            const uint2 pixelCoord = uint2(pixelIdx % uint(width), pixelIdx / uint(width));
+            TraceFullPathForPixel(pixelIdx, pixelCoord, uint(width), uint(height));
+        }
+    }
+    else
+    {
+        while(true)
+        {
+            uint waveBaseIdx = 0;
+            const uint laneIdx = ActiveWaveLaneIndex();
+            const uint waveSize = ActiveWaveLaneCount();
+            const uint batchWaves = max(RayTraceCB.WavefrontPadding, 1u);
+            const uint batchSize = waveSize * batchWaves;
 
-            if(validWork)
+            if(WaveIsFirstLane())
+                InterlockedAdd(WavefrontCounters[Counter_WorkCursor], batchSize, waveBaseIdx);
+
+            waveBaseIdx = WaveReadLaneFirst(waveBaseIdx);
+            const bool batchHasWork = waveBaseIdx < RayTraceCB.TotalNumPixels;
+
+            if(WaveActiveAnyTrue(batchHasWork) == false)
+                break;
+
+            for(uint batchWave = 0; batchWave < batchWaves; ++batchWave)
             {
-                const uint2 pixelCoord = uint2(pixelIdx % uint(width), pixelIdx / uint(width));
-                TraceFullPathForPixel(pixelIdx, pixelCoord, uint(width), uint(height));
+                const uint pixelIdx = waveBaseIdx + batchWave * waveSize + laneIdx;
+                const bool validWork = pixelIdx < RayTraceCB.TotalNumPixels;
+
+                if(validWork)
+                {
+                    const uint2 pixelCoord = uint2(pixelIdx % uint(width), pixelIdx / uint(width));
+                    TraceFullPathForPixel(pixelIdx, pixelCoord, uint(width), uint(height));
+                }
             }
         }
     }
 }
+
 
 [numthreads(WAVEFRONT_THREAD_GROUP_SIZE, 1, 1)]
 void WavefrontClearReorderCS(uint3 dispatchThreadID : SV_DispatchThreadID)

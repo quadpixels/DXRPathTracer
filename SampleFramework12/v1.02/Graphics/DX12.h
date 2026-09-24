@@ -36,6 +36,9 @@ extern uint64 CurrFrameIdx;     // CurrentCPUFrame % RenderLatency
 void Initialize(D3D_FEATURE_LEVEL minFeatureLevel, uint32 adapterIdx);
 void Shutdown();
 
+// Returns postmortem information after a device removal, when DRED is available.
+std::wstring GetDeviceRemovedDiagnostics();
+
 // Frame submission synchronization
 void BeginFrame();
 void EndFrame(IDXGISwapChain4* swapChain, uint32 syncIntervals);

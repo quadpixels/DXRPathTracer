@@ -51,6 +51,8 @@ struct RayTraceConstants
     uint WavefrontThreadGroupSize;
     uint DispatchWidth;
     uint DispatchHeight;
+    uint PersistentWorkerCount;
+    uint PersistentRayGenMaxIterations;
 };
 
 struct LightConstants
@@ -61,6 +63,7 @@ struct LightConstants
 
 RaytracingAccelerationStructure Scene : register(t0, space200);
 RWTexture2D<float4> RenderTarget : register(u0);
+RWStructuredBuffer<uint> WavefrontCounters : register(u5);
 
 ConstantBuffer<RayTraceConstants> RayTraceCB : register(b0);
 
@@ -85,6 +88,8 @@ struct ShadowPayload
     float Visibility;
 };
 
+static const uint Counter_WorkCursor = 132;
+
 enum RayTypes {
     RayTypeRadiance = 0,
     RayTypeShadow = 1,
@@ -99,99 +104,30 @@ static float2 SamplePoint(in uint pixelIdx, inout uint setIdx)
     return SampleCMJ2D(RayTraceCB.CurrSampleIdx, AppSettings.SqrtNumSamples, AppSettings.SqrtNumSamples, permutation);
 }
 
+#include "RayGenHelpers.hlsli"
+
 [shader("raygeneration")]
 void RaygenShader()
 {
     const uint3 dispatchIndex = DispatchRaysIndex();
-    const uint dispatchWidth = DispatchRaysDimensions().x;
-    const uint dispatchHeight = DispatchRaysDimensions().y;
-    const uint dispatchIdx = dispatchIndex.y * dispatchWidth + dispatchIndex.x;
-    const uint dispatchStride = dispatchWidth * dispatchHeight;
-    const bool tiledPersistentWarp = (RayTraceCB.myFlags & 16u) != 0u;
-    const uint tileCountX = (RayTraceCB.DispatchWidth + dispatchWidth - 1u) / dispatchWidth;
-    const uint tileCountY = (RayTraceCB.DispatchHeight + dispatchHeight - 1u) / dispatchHeight;
-    const uint workItemCount = tiledPersistentWarp ? tileCountX * tileCountY :
-                               (RayTraceCB.TotalNumPixels + dispatchStride - 1u) / dispatchStride;
+    const RayGenWorkInfo workInfo = MakeRayGenWorkInfo(dispatchIndex);
+    uint workItem = workInfo.Atomic ? 0u : (workInfo.Tiled ? 0u : workInfo.DispatchIndex);
 
-    for(uint workItem = 0; workItem < workItemCount; ++workItem)
+    uint iterations = 0;
+    while((!workInfo.Atomic || iterations < RayTraceCB.PersistentRayGenMaxIterations) &&
+          AcquireRayGenWork(workInfo, workItem))
     {
-    uint pixelIdx;
-    uint2 pixelCoord;
-    if(tiledPersistentWarp)
-    {
-        const uint tileX = workItem % tileCountX;
-        const uint tileY = workItem / tileCountX;
-        pixelCoord = dispatchIndex.xy + uint2(tileX * dispatchWidth, tileY * dispatchHeight);
-        if(pixelCoord.x >= RayTraceCB.DispatchWidth || pixelCoord.y >= RayTraceCB.DispatchHeight)
-            continue;
-        pixelIdx = pixelCoord.y * RayTraceCB.DispatchWidth + pixelCoord.x;
-    }
-    else
-    {
-        pixelIdx = dispatchIdx + workItem * dispatchStride;
-        if(pixelIdx >= RayTraceCB.TotalNumPixels)
-            break;
-        pixelCoord = uint2(pixelIdx % RayTraceCB.DispatchWidth, pixelIdx / RayTraceCB.DispatchWidth);
-    }
+        uint pixelIdx;
+        uint2 pixelCoord;
+        if(ResolveRayGenPixel(workInfo, workItem, pixelIdx, pixelCoord))
+            TraceRayGenPixel(pixelIdx, pixelCoord);
 
-    uint sampleSetIdx = 0;
+        if(!workInfo.Atomic)
+            workItem += workInfo.StaticWorkItemStep;
 
-    // Form a primary ray by un-projecting the pixel coordinate using the inverse view * projection matrix
-    float2 primaryRaySample = SamplePoint(pixelIdx, sampleSetIdx);
-
-    float2 rayPixelPos = pixelCoord + primaryRaySample;
-    float2 ncdXY = (rayPixelPos / (float2(RayTraceCB.DispatchWidth, RayTraceCB.DispatchHeight) * 0.5f)) - 1.0f;
-    ncdXY.y *= -1.0f;
-    float4 rayStart = mul(float4(ncdXY, 0.0f, 1.0f), RayTraceCB.InvViewProjection);
-    float4 rayEnd = mul(float4(ncdXY, 1.0f, 1.0f), RayTraceCB.InvViewProjection);
-
-    rayStart.xyz /= rayStart.w;
-    rayEnd.xyz /= rayEnd.w;
-    float3 rayDir = normalize(rayEnd.xyz - rayStart.xyz);
-    float rayLength = length(rayEnd.xyz - rayStart.xyz);
-
-    // Trace a primary ray
-    RayDesc ray;
-    ray.Origin = rayStart.xyz;
-    ray.Direction = rayDir;
-    ray.TMin = 0.0f;
-    ray.TMax = rayLength;
-
-    PrimaryPayload payload;
-    payload.Radiance = 0.0f;
-    payload.Roughness = 0.0f;
-    payload.PathLength = 1;       // 6b
-    payload.PixelIdx = pixelIdx;  // 24b
-    payload.SampleSetIdx = sampleSetIdx;
-    payload.IsDiffuse = false;    // 1b
-
-    uint traceRayFlags = 0;
-
-    // Stop using the any-hit shader once we've hit the max path length, since it's *really* expensive
-    if(payload.PathLength > AppSettings.MaxAnyHitPathLength)
-        traceRayFlags = RAY_FLAG_FORCE_OPAQUE;
-
-    const uint hitGroupOffset = RayTypeRadiance;
-    const uint hitGroupGeoMultiplier = NumRayTypes;
-    const uint missShaderIdx = RayTypeRadiance;
-    TraceRay(Scene, traceRayFlags, 0xFFFFFFFF, hitGroupOffset, hitGroupGeoMultiplier, missShaderIdx, ray, payload);
-
-    payload.Radiance = clamp(payload.Radiance, 0.0f, FP16Max);
-
-    // Update the progressive result with the new radiance sample
-    const float lerpFactor = RayTraceCB.CurrSampleIdx / (RayTraceCB.CurrSampleIdx + 1.0f);
-    float3 newSample = payload.Radiance;
-    float3 currValue = RenderTarget[pixelCoord].xyz;
-    float3 newValue = lerp(newSample, currValue, lerpFactor);
-    
-    if (RayTraceCB.CurrSampleIdx == 0) {  // Prevent NAN from sticking
-        newValue = newSample;
-    }
-
-    RenderTarget[pixelCoord] = float4(newValue, 1.0f);
+        ++iterations;
     }
 }
-
 static float3 PathTrace(in MeshVertex hitSurface, in Material material, in PrimaryPayload inPayload)
 {
     if((!AppSettings.EnableDiffuse && !AppSettings.EnableSpecular) ||
@@ -586,3 +522,4 @@ void ShadowMissShader(inout ShadowPayload payload)
 {
     payload.Visibility = 1.0f;
 }
+

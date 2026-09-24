@@ -147,6 +147,23 @@
     <ClCompile Include="DXRPathTracer.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <None Include="RayTracingPath_Recursive.inl" />
+    <None Include="RayTracingPath_DXR10Persistent.inl" />
+    <None Include="RayTracingPath_RayQuery.inl" />
+    <None Include="RayTracingPath_Wavefront.inl" />
+    <None Include="RayTracingPath_Persistent.inl" />
+    <None Include="RayTracingPath_DXR10Recursive.inl" />
+    <None Include="RayTracingPath_DXR10SER.inl" />
+    <None Include="RayTracingPath_DXR10LoopSER.inl" />
+    <None Include="RayTracingPath_DXR10LoopMy.inl" />
+    <None Include="RayTracingPath_RayQueryPersistent.inl" />
+    <None Include="RayTracingPath_RayQueryTemplate.inl" />
+    <None Include="RayTracingPath_RayQueryLoop.inl" />
+    <None Include="RayTracingPath_GlobalQueue.inl" />
+    <None Include="RayTracingPath_PersistentWarps.inl" />
+    <None Include="RayGenHelpers.hlsli" />
+  </ItemGroup>
+  <ItemGroup>
     <ClInclude Include="..\SampleFramework12\v1.02\App.h" />
     <ClInclude Include="..\SampleFramework12\v1.02\Assert.h" />
     <ClInclude Include="..\SampleFramework12\v1.02\Containers.h" />

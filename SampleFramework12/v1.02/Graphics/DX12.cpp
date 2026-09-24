@@ -55,6 +55,62 @@ D3D_FEATURE_LEVEL FeatureLevel = D3D_FEATURE_LEVEL_11_0;
 IDXGIFactory5* Factory = nullptr;
 IDXGIAdapter1* Adapter = nullptr;
 
+std::wstring GetDeviceRemovedDiagnostics()
+{
+    if(Device == nullptr)
+        return L"D3D12 device is null.\n";
+
+    const HRESULT reason = Device->GetDeviceRemovedReason();
+    std::wstring result = MakeString(L"GetDeviceRemovedReason: 0x%08X (%s)\n",
+                                     static_cast<uint32>(reason),
+                                     GetDXErrorString(reason).c_str());
+
+    ID3D12DeviceRemovedExtendedData2* dred = nullptr;
+    if(FAILED(Device->QueryInterface(IID_PPV_ARGS(&dred))))
+    {
+        result += L"DRED 1.2 output is unavailable.\n";
+        return result;
+    }
+
+    D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT1 breadcrumbs = { };
+    if(SUCCEEDED(dred->GetAutoBreadcrumbsOutput1(&breadcrumbs)))
+    {
+        uint32 nodeCount = 0;
+        for(const D3D12_AUTO_BREADCRUMB_NODE1* node = breadcrumbs.pHeadAutoBreadcrumbNode;
+            node != nullptr && nodeCount < 32; node = node->pNext, ++nodeCount)
+        {
+            const UINT last = node->pLastBreadcrumbValue != nullptr ? *node->pLastBreadcrumbValue : 0;
+            const UINT opIndex = last > 0 ? last - 1 : 0;
+            const wchar* listName = node->pCommandListDebugNameW != nullptr
+                ? node->pCommandListDebugNameW : L"<unnamed command list>";
+
+            result += MakeString(L"Breadcrumb: %s, last=%u/%u",
+                                 listName, last, node->BreadcrumbCount);
+            if(node->pCommandHistory != nullptr && last > 0 && last <= node->BreadcrumbCount)
+                result += MakeString(L", op=%u", static_cast<uint32>(node->pCommandHistory[opIndex]));
+            result += L"\n";
+        }
+    }
+
+    D3D12_DRED_PAGE_FAULT_OUTPUT2 pageFault = { };
+    if(SUCCEEDED(dred->GetPageFaultAllocationOutput2(&pageFault)))
+    {
+        result += MakeString(L"DRED PageFaultVA: 0x%llX\n",
+                             static_cast<unsigned long long>(pageFault.PageFaultVA));
+
+        const D3D12_DRED_ALLOCATION_NODE1* node = pageFault.pHeadExistingAllocationNode;
+        if(node != nullptr)
+        {
+            result += L"PageFault allocation: ";
+            result += node->ObjectNameW != nullptr ? node->ObjectNameW : L"<unnamed>";
+            result += L"\n";
+        }
+    }
+
+    dred->Release();
+    return result;
+}
+
 uint64 CurrentCPUFrame = 0;
 uint64 CurrentGPUFrame = 0;
 uint64 CurrFrameIdx = 0;
@@ -148,6 +204,19 @@ void Initialize(D3D_FEATURE_LEVEL minFeatureLevel, uint32 adapterIdx)
             debug1->SetEnableGPUBasedValidation(true);
         #endif
     #endif
+
+    // Enable device-removal diagnostics before creating the device. DRED is
+    // especially useful for GPU hangs because the original failing command
+    // is otherwise lost by the time GetDeviceRemovedReason() is queried.
+    {
+        ID3D12DeviceRemovedExtendedDataSettings2* dredSettings = nullptr;
+        if(SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dredSettings))))
+        {
+            dredSettings->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+            dredSettings->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+            dredSettings->Release();
+        }
+    }
 
     DXCall(D3D12CreateDevice(Adapter, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&Device)));
 

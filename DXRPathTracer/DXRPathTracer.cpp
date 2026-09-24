@@ -68,6 +68,7 @@ StaticAssert_(ArraySize_(SceneSunDirections) == uint64(Scenes::NumValues));
 
 int g_render_path = 0;  // 0=DXR1.0 original, 1=DXR1.0 SER, 2=DXR1.0 loop SER, 3=DXR1.0 loop my, 4=DXR1.1 recursion, 5=DXR1.1 loop, 6=DXR1.1 wavefront, 7=DXR1.1 persistent wavefront, 8=DXR1.1 persistent warps, 9=DXR1.1 GPU wavefront, 10=DXR1.1 persistent wavefront global queue, 11=DXR1.0 persistent warp, 12=DXR1.0+1.1 RayQuery persistent warp, 13=DXR1.0 tiled persistent warp
 int g_wavefront_thread_group_size = 64;
+int g_persistent_worker_groups_actual = 0;
 static int g_commandLinePreset = 0;
 
 void ApplyPreset(int preset)
@@ -195,6 +196,8 @@ struct RayTraceConstants
     uint32 WavefrontThreadGroupSize = 64;
     uint32 DispatchWidth = 0;
     uint32 DispatchHeight = 0;
+    uint32 PersistentWorkerCount = 0;
+    uint32 PersistentRayGenMaxIterations = 0;
 };
 
 struct WavefrontPathState
@@ -1842,6 +1845,12 @@ void DXRPathTracer::RenderRayTracing()
     if (g_render_path == 13) {
       rtConstants.myFlags |= 16;
     }
+    if (g_render_path == 14) {
+      rtConstants.myFlags |= 32;
+    }
+    if (g_render_path == 15 || g_render_path == 16) {
+      rtConstants.myFlags |= 64;
+    }
 
     DX12::BindTempConstantBuffer(cmdList, rtConstants, RTParams_CBuffer, CmdListMode::Compute);
 
@@ -1853,22 +1862,12 @@ void DXRPathTracer::RenderRayTracing()
 
     auto clearWavefrontCounters = [&]()
     {
-        if(g_wavefront_use_clear_uav)
-        {
-            ProfileBlock clearPB(cmdList, "Wavefront Counter Clear (UAV)");
-            D3D12_CPU_DESCRIPTOR_HANDLE counterUAV = wavefrontCounterBuffer.UAV;
-            D3D12_GPU_DESCRIPTOR_HANDLE counterUAVGPU = DX12::TempDescriptorTable(&counterUAV, 1);
-            const uint32 clearValues[4] = { 0, 0, 0, 0 };
-            cmdList->ClearUnorderedAccessViewUint(counterUAVGPU, counterUAV,
-                                                  wavefrontCounterBuffer.InternalBuffer.Resource,
-                                                  clearValues, 0, nullptr);
-        }
-        else
-        {
-            ProfileBlock clearPB(cmdList, "Wavefront Counter Clear (Kernel)");
-            cmdList->SetPipelineState(wavefrontClearPSO);
-            DX12::CmdList->Dispatch(1, 1, 1);
-        }
+        // ClearUnorderedAccessView* is invalid for Structured Buffers.
+        // Wavefront Counters is a structured uint buffer, so use the kernel
+        // path regardless of the generic UAV-clear setting.
+        ProfileBlock clearPB(cmdList, "Wavefront Counter Clear (Kernel)");
+        cmdList->SetPipelineState(wavefrontClearPSO);
+        DX12::CmdList->Dispatch(3, 1, 1);
         wavefrontCounterBuffer.UAVBarrier(cmdList);
     };
 
@@ -1898,706 +1897,36 @@ void DXRPathTracer::RenderRayTracing()
     else if(activeRenderPath == 12 && rtRayQueryPersistentPSO == nullptr)
         activeRenderPath = 5;
 
+    g_persistent_worker_groups_actual = 0;
+    if(activeRenderPath == 11 || activeRenderPath == 12 || activeRenderPath == 13 ||
+       activeRenderPath == 14 || activeRenderPath == 15 || activeRenderPath == 16)
+    {
+        const uint32 requestedGroups = uint32(Max<int>(g_persistent_worker_groups, 1));
+        uint32 effectiveGroups = requestedGroups;
+
+        // Atomic DXR 1.0 RayGen workers process the pixel pool in a loop.
+        // Avoid configurations that make each worker process an excessive
+        // number of TraceRay calls and are likely to hit the OS TDR timeout.
+        if(activeRenderPath == 15)
+        {
+            const uint64 totalPixels = uint64(rtTarget.Width()) * uint64(rtTarget.Height());
+            const uint32 workerWidth = Max<uint32>(ActiveWavefrontThreadGroupSize(), 1);
+            const uint64 maxWorkItemsPerWorker = 16;
+            const uint64 minimumWorkers = (totalPixels + maxWorkItemsPerWorker - 1) / maxWorkItemsPerWorker;
+            const uint32 minimumGroups = uint32((minimumWorkers + workerWidth - 1) / workerWidth);
+            effectiveGroups = Max(effectiveGroups, minimumGroups);
+        }
+
+        g_persistent_worker_groups_actual = effectiveGroups;
+    }
+
     switch (activeRenderPath) {
-    case 0: {
-      ProfileBlock pb(cmdList, "TraceRay DispatchRays (original, recursive)");
-      cmdList->SetPipelineState1(rtPSO);
-      D3D12_DISPATCH_RAYS_DESC dispatchDesc = {};
-      dispatchDesc.HitGroupTable = rtHitTable.ShaderTable();
-      dispatchDesc.MissShaderTable = rtMissTable.ShaderTable();
-      dispatchDesc.RayGenerationShaderRecord = rtRayGenTable.ShaderRecord(0);
-      dispatchDesc.Width = uint32(rtTarget.Width());
-      dispatchDesc.Height = uint32(rtTarget.Height());
-      dispatchDesc.Depth = 1;
-      DX12::CmdList->DispatchRays(&dispatchDesc);
-      break;
+        #include "RayTracingPath_Recursive.inl"
+        #include "RayTracingPath_DXR10Persistent.inl"
+        #include "RayTracingPath_RayQuery.inl"
+        #include "RayTracingPath_Wavefront.inl"
+        #include "RayTracingPath_Persistent.inl"
     }
-    case 11: {
-      ProfileBlock pb(cmdList, "TraceRay DispatchRays (DXR 1.0 Persistent Warp)");
-      cmdList->SetPipelineState1(rtPSO);
-      D3D12_DISPATCH_RAYS_DESC dispatchDesc = {};
-      dispatchDesc.HitGroupTable = rtHitTable.ShaderTable();
-      dispatchDesc.MissShaderTable = rtMissTable.ShaderTable();
-      dispatchDesc.RayGenerationShaderRecord = rtRayGenTable.ShaderRecord(0);
-      dispatchDesc.Width = ActiveWavefrontThreadGroupSize();
-      dispatchDesc.Height = uint32(Max<int>(g_persistent_worker_groups, 1));
-      dispatchDesc.Depth = 1;
-      DX12::CmdList->DispatchRays(&dispatchDesc);
-      break;
-    }
-    case 13: {
-      ProfileBlock pb(cmdList, "TraceRay DispatchRays (DXR 1.0 Tiled Persistent Warp)");
-      cmdList->SetPipelineState1(rtPSO);
-      D3D12_DISPATCH_RAYS_DESC dispatchDesc = {};
-      dispatchDesc.HitGroupTable = rtHitTable.ShaderTable();
-      dispatchDesc.MissShaderTable = rtMissTable.ShaderTable();
-      dispatchDesc.RayGenerationShaderRecord = rtRayGenTable.ShaderRecord(0);
-      dispatchDesc.Width = ActiveWavefrontThreadGroupSize();
-      dispatchDesc.Height = uint32(Max<int>(g_persistent_worker_groups, 1));
-      dispatchDesc.Depth = 1;
-      DX12::CmdList->DispatchRays(&dispatchDesc);
-      break;
-    }
-    case 12: {
-      ProfileBlock pb(cmdList, "RayQuery Persistent Warps (RayGen)");
-      cmdList->SetPipelineState1(rtRayQueryPersistentPSO);
-      D3D12_DISPATCH_RAYS_DESC dispatchDesc = {};
-      dispatchDesc.RayGenerationShaderRecord = rtRayQueryPersistentRayGenTable.ShaderRecord(0);
-      dispatchDesc.Width = ActiveWavefrontThreadGroupSize();
-      dispatchDesc.Height = uint32(Max<int>(g_persistent_worker_groups, 1));
-      dispatchDesc.Depth = 1;
-      DX12::CmdList->DispatchRays(&dispatchDesc);
-      break;
-    }
-    case 1: {
-      ProfileBlock pb(cmdList, "TraceRay DispatchRays (recursive, SER)");
-      cmdList->SetPipelineState1(rtPSO_SER);
-      D3D12_DISPATCH_RAYS_DESC dispatchDesc = {};
-      dispatchDesc.HitGroupTable = rtHitTable_SER.ShaderTable();
-      dispatchDesc.MissShaderTable = rtMissTable_SER.ShaderTable();
-      dispatchDesc.RayGenerationShaderRecord = rtRayGenTable_SER.ShaderRecord(0);
-      dispatchDesc.Width = uint32(rtTarget.Width());
-      dispatchDesc.Height = uint32(rtTarget.Height());
-      dispatchDesc.Depth = 1;
-      DX12::CmdList->DispatchRays(&dispatchDesc);
-      break;
-      break;
-    }
-    case 2: {
-      ProfileBlock pb(cmdList, "TraceRay DispatchRays (loop, SER)");
-      cmdList->SetPipelineState1(rtPSOLoop_SER);
-      D3D12_DISPATCH_RAYS_DESC dispatchDesc = {};
-      dispatchDesc.HitGroupTable = rtHitTableLoop_SER.ShaderTable();
-      dispatchDesc.MissShaderTable = rtMissTableLoop_SER.ShaderTable();
-      dispatchDesc.RayGenerationShaderRecord = rtRayGenTableLoop_SER.ShaderRecord(0);
-      dispatchDesc.Width = uint32(rtTarget.Width());
-      dispatchDesc.Height = uint32(rtTarget.Height());
-      dispatchDesc.Depth = 1;
-      DX12::CmdList->DispatchRays(&dispatchDesc);
-      break;
-      break;
-    }
-    case 3: {
-      ProfileBlock pb(cmdList, "TraceRay DispatchRays (loop, my)");
-      cmdList->SetPipelineState1(rtPSOLoop_my);
-      D3D12_DISPATCH_RAYS_DESC dispatchDesc = {};
-      dispatchDesc.HitGroupTable = rtHitTableLoop_my.ShaderTable();
-      dispatchDesc.MissShaderTable = rtMissTableLoop_my.ShaderTable();
-      dispatchDesc.RayGenerationShaderRecord = rtRayGenTableLoop_my.ShaderRecord(0);
-      dispatchDesc.Width = uint32(rtTarget.Width());
-      dispatchDesc.Height = uint32(rtTarget.Height());
-      dispatchDesc.Depth = 1;
-      DX12::CmdList->DispatchRays(&dispatchDesc);
-      break;
-      break;
-    }
-    case 4: {
-      ProfileBlock pb(cmdList, "RayQuery Dispatch (template)");
-      cmdList->SetPipelineState(rtRayQueryPSO);
-      uint32_t gx, gy;
-      gx = static_cast<uint32_t>(rtTarget.Width() - 1) / 8 + 1;
-      gy = static_cast<uint32_t>(rtTarget.Height() - 1) / 8 + 1;
-      DX12::CmdList->Dispatch(gx, gy, 1);
-      break;
-    }
-    case 5: {
-      ProfileBlock pb(cmdList, "RayQuery Dispatch (loop)");
-      cmdList->SetPipelineState(rtRayQuery1PSO);
-      uint32_t gx, gy;
-      gx = static_cast<uint32_t>(rtTarget.Width() - 1) / 8 + 1;
-      gy = static_cast<uint32_t>(rtTarget.Height() - 1) / 8 + 1;
-      DX12::CmdList->Dispatch(gx, gy, 1);
-      break;
-    }
-    case 6:
-    case 9: {
-      const bool gpuWavefrontPath = activeRenderPath == 9;
-      ProfileBlock pb(cmdList, gpuWavefrontPath ? "RayQuery GPU Wavefront Dispatch" : "RayQuery Wavefront Dispatch");
-
-      static const char* TraceHitProfileNames[] =
-      {
-          "WF Trace Hits B0",
-          "WF Trace Hits B1",
-          "WF Trace Hits B2",
-          "WF Trace Hits B3",
-          "WF Trace Hits B4",
-          "WF Trace Hits B5",
-          "WF Trace Hits B6",
-          "WF Trace Hits B7",
-      };
-
-      static const char* HitSortProfileNames[] =
-      {
-          "WF Hit Sort B0",
-          "WF Hit Sort B1",
-          "WF Hit Sort B2",
-          "WF Hit Sort B3",
-          "WF Hit Sort B4",
-          "WF Hit Sort B5",
-          "WF Hit Sort B6",
-          "WF Hit Sort B7",
-      };
-
-      static const char* PrepareAfterTraceProfileNames[] =
-      {
-          "WF Prepare Args After Trace B0",
-          "WF Prepare Args After Trace B1",
-          "WF Prepare Args After Trace B2",
-          "WF Prepare Args After Trace B3",
-          "WF Prepare Args After Trace B4",
-          "WF Prepare Args After Trace B5",
-          "WF Prepare Args After Trace B6",
-          "WF Prepare Args After Trace B7",
-      };
-
-      static const char* PrepareAfterShadeProfileNames[] =
-      {
-          "WF Prepare Args After Shade B0",
-          "WF Prepare Args After Shade B1",
-          "WF Prepare Args After Shade B2",
-          "WF Prepare Args After Shade B3",
-          "WF Prepare Args After Shade B4",
-          "WF Prepare Args After Shade B5",
-          "WF Prepare Args After Shade B6",
-          "WF Prepare Args After Shade B7",
-      };
-
-      static const char* ShadeHitProfileNames[] =
-      {
-          "WF Shade Hits B0",
-          "WF Shade Hits B1",
-          "WF Shade Hits B2",
-          "WF Shade Hits B3",
-          "WF Shade Hits B4",
-          "WF Shade Hits B5",
-          "WF Shade Hits B6",
-          "WF Shade Hits B7",
-      };
-
-      static const char* TraceShadowProfileNames[] =
-      {
-          "WF Trace Shadows B0",
-          "WF Trace Shadows B1",
-          "WF Trace Shadows B2",
-          "WF Trace Shadows B3",
-          "WF Trace Shadows B4",
-          "WF Trace Shadows B5",
-          "WF Trace Shadows B6",
-          "WF Trace Shadows B7",
-      };
-
-      static const char* AdvanceProfileNames[] =
-      {
-          "WF Advance B0",
-          "WF Advance B1",
-          "WF Advance B2",
-          "WF Advance B3",
-          "WF Advance B4",
-          "WF Advance B5",
-          "WF Advance B6",
-          "WF Advance B7",
-      };
-
-      D3D12_CPU_DESCRIPTOR_HANDLE uavs[] =
-      {
-          rtTarget.UAV,
-          wavefrontPathStateBuffer.UAV,
-          wavefrontRayQueueA.UAV,
-          wavefrontRayQueueB.UAV,
-          wavefrontShadowQueue.UAV,
-          wavefrontCounterBuffer.UAV,
-          wavefrontHitQueueA.UAV,
-          wavefrontHitQueueB.UAV,
-          wavefrontDispatchArgsBuffer.UAV,
-      };
-      DX12::BindTempDescriptorTable(cmdList, uavs, ArraySize_(uavs), RTParams_UAVDescriptor, CmdListMode::Compute);
-
-      const uint32 width = uint32(rtTarget.Width());
-      const uint32 height = uint32(rtTarget.Height());
-      const uint32 gx = (width + 7) / 8;
-      const uint32 gy = (height + 7) / 8;
-      const uint64 dispatchArgsStride = sizeof(D3D12_DISPATCH_ARGUMENTS);
-      const uint64 currentRayDispatchArgsOffset = 0 * dispatchArgsStride;
-      const uint64 hitDispatchArgsOffset = 1 * dispatchArgsStride;
-      const uint64 shadowDispatchArgsOffset = 2 * dispatchArgsStride;
-      const uint64 hitMetaDispatchArgsOffset = 3 * dispatchArgsStride;
-      const uint64 sortHitDispatchArgsOffset = 4 * dispatchArgsStride;
-      const uint64 scatterHitDispatchArgsOffset = 5 * dispatchArgsStride;
-      D3D12_RESOURCE_STATES dispatchArgsState = D3D12_RESOURCE_STATE_COMMON;
-
-      auto bindWavefrontConstants = [&](uint32 bounce, uint32 readQueue, uint32 writeQueue)
-      {
-          const bool sortThisBounce = g_wavefront_reorder && (bounce > 0 || g_wavefront_skip_primary_sort == false);
-
-          rtConstants.myFlags &= ~(2u | 4u);
-          if(sortThisBounce && g_wavefront_block_sort == false)
-              rtConstants.myFlags |= 2u;
-          else if(sortThisBounce && g_wavefront_block_sort)
-              rtConstants.myFlags |= 4u;
-
-          rtConstants.WavefrontBounce = bounce;
-          rtConstants.WavefrontReadQueue = readQueue;
-          rtConstants.WavefrontWriteQueue = writeQueue;
-          DX12::BindTempConstantBuffer(cmdList, rtConstants, RTParams_CBuffer, CmdListMode::Compute);
-      };
-
-      auto prepareWavefrontDispatchArgs = [&](const char* profileName)
-      {
-          ProfileBlock preparePB(cmdList, profileName);
-
-          if(dispatchArgsState != D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
-          {
-              wavefrontDispatchArgsBuffer.Transition(cmdList, dispatchArgsState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-              dispatchArgsState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-          }
-
-          cmdList->SetPipelineState(wavefrontPrepareDispatchArgsPSO);
-          DX12::CmdList->Dispatch(1, 1, 1);
-          wavefrontDispatchArgsBuffer.UAVBarrier(cmdList);
-          wavefrontDispatchArgsBuffer.Transition(cmdList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
-          dispatchArgsState = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
-      };
-
-      bindWavefrontConstants(0, 0, 1);
-      clearWavefrontCounters();
-
-      {
-          ProfileBlock generatePB(cmdList, "WF Generate Primary");
-          cmdList->SetPipelineState(wavefrontGeneratePrimaryPSO);
-          DX12::CmdList->Dispatch(gx, gy, 1);
-          wavefrontPathStateBuffer.UAVBarrier(cmdList);
-          wavefrontRayQueueA.UAVBarrier(cmdList);
-          wavefrontCounterBuffer.UAVBarrier(cmdList);
-      }
-      prepareWavefrontDispatchArgs("WF Prepare Args Initial");
-
-      uint32 currentQueue = 0;
-      for(uint32 bounce = 0; bounce < uint32(AppSettings::MaxPathLength); ++bounce)
-      {
-          const uint32 nextQueue = currentQueue ^ 1;
-          bindWavefrontConstants(bounce, currentQueue, nextQueue);
-
-          {
-              ProfileBlock tracePB(cmdList, TraceHitProfileNames[bounce]);
-              cmdList->SetPipelineState(wavefrontTraceHitsPSOVariants[wavefrontVariantIdx]);
-              cmdList->ExecuteIndirect(wavefrontDispatchCommandSignature, 1, wavefrontDispatchArgsBuffer.Resource(),
-                                       currentRayDispatchArgsOffset, nullptr, 0);
-              wavefrontPathStateBuffer.UAVBarrier(cmdList);
-              wavefrontRayQueueA.UAVBarrier(cmdList);
-              wavefrontRayQueueB.UAVBarrier(cmdList);
-              wavefrontHitQueueA.UAVBarrier(cmdList);
-              wavefrontHitQueueB.UAVBarrier(cmdList);
-              wavefrontCounterBuffer.UAVBarrier(cmdList);
-          }
-          prepareWavefrontDispatchArgs(PrepareAfterTraceProfileNames[bounce]);
-
-          uint32 hitReadQueue = currentQueue;
-          // Only a global sort produces a new hit ordering. Without it, and for
-          // block-local sorting, shade can consume the hit queue in place.
-          const bool globalSortThisBounce = g_wavefront_reorder &&
-                                             g_wavefront_block_sort == false &&
-                                             (bounce > 0 || g_wavefront_skip_primary_sort == false);
-          const uint32 hitWriteQueue = globalSortThisBounce ? hitReadQueue ^ 1 : hitReadQueue;
-          bindWavefrontConstants(bounce, hitReadQueue, hitWriteQueue);
-
-          if(gpuWavefrontPath || globalSortThisBounce)
-          {
-              ProfileBlock sortPB(cmdList, HitSortProfileNames[bounce]);
-              cmdList->SetPipelineState(wavefrontClearReorderPSO);
-              cmdList->ExecuteIndirect(wavefrontDispatchCommandSignature, 1, wavefrontDispatchArgsBuffer.Resource(),
-                                       hitMetaDispatchArgsOffset, nullptr, 0);
-              wavefrontCounterBuffer.UAVBarrier(cmdList);
-
-              cmdList->SetPipelineState(wavefrontCountReorderBinsPSOVariants[wavefrontVariantIdx]);
-              cmdList->ExecuteIndirect(wavefrontDispatchCommandSignature, 1, wavefrontDispatchArgsBuffer.Resource(),
-                                       sortHitDispatchArgsOffset, nullptr, 0);
-              wavefrontCounterBuffer.UAVBarrier(cmdList);
-
-              cmdList->SetPipelineState(wavefrontPrefixReorderBinsPSO);
-              cmdList->ExecuteIndirect(wavefrontDispatchCommandSignature, 1, wavefrontDispatchArgsBuffer.Resource(),
-                                       hitMetaDispatchArgsOffset, nullptr, 0);
-              wavefrontCounterBuffer.UAVBarrier(cmdList);
-
-              cmdList->SetPipelineState(wavefrontScatterReorderedRaysPSOVariants[wavefrontVariantIdx]);
-              cmdList->ExecuteIndirect(wavefrontDispatchCommandSignature, 1, wavefrontDispatchArgsBuffer.Resource(),
-                                       gpuWavefrontPath ? scatterHitDispatchArgsOffset : hitDispatchArgsOffset, nullptr, 0);
-              if(globalSortThisBounce)
-              {
-                  wavefrontHitQueueA.UAVBarrier(cmdList);
-                  wavefrontHitQueueB.UAVBarrier(cmdList);
-                  wavefrontCounterBuffer.UAVBarrier(cmdList);
-              }
-          }
-
-          bindWavefrontConstants(bounce, hitWriteQueue, nextQueue);
-          {
-              ProfileBlock shadePB(cmdList, ShadeHitProfileNames[bounce]);
-              cmdList->SetPipelineState(wavefrontShadeHitsPSOVariants[wavefrontVariantIdx]);
-              cmdList->ExecuteIndirect(wavefrontDispatchCommandSignature, 1, wavefrontDispatchArgsBuffer.Resource(),
-                                       hitDispatchArgsOffset, nullptr, 0);
-              wavefrontPathStateBuffer.UAVBarrier(cmdList);
-              wavefrontRayQueueA.UAVBarrier(cmdList);
-              wavefrontRayQueueB.UAVBarrier(cmdList);
-              wavefrontShadowQueue.UAVBarrier(cmdList);
-              wavefrontCounterBuffer.UAVBarrier(cmdList);
-          }
-          prepareWavefrontDispatchArgs(PrepareAfterShadeProfileNames[bounce]);
-
-          {
-              ProfileBlock shadowPB(cmdList, TraceShadowProfileNames[bounce]);
-              cmdList->SetPipelineState(wavefrontTraceShadowsPSOVariants[wavefrontVariantIdx]);
-              cmdList->ExecuteIndirect(wavefrontDispatchCommandSignature, 1, wavefrontDispatchArgsBuffer.Resource(),
-                                       shadowDispatchArgsOffset, nullptr, 0);
-              wavefrontPathStateBuffer.UAVBarrier(cmdList);
-              wavefrontCounterBuffer.UAVBarrier(cmdList);
-          }
-
-          currentQueue = nextQueue;
-
-          {
-              ProfileBlock advancePB(cmdList, AdvanceProfileNames[bounce]);
-              cmdList->SetPipelineState(wavefrontAdvancePSO);
-              DX12::CmdList->Dispatch(1, 1, 1);
-              wavefrontCounterBuffer.UAVBarrier(cmdList);
-          }
-      }
-
-      bindWavefrontConstants(0, 0, 1);
-      {
-          ProfileBlock accumulatePB(cmdList, "WF Accumulate");
-          cmdList->SetPipelineState(wavefrontAccumulatePSO);
-          DX12::CmdList->Dispatch(gx, gy, 1);
-          wavefrontPathStateBuffer.UAVBarrier(cmdList);
-          rtTarget.UAVBarrier(cmdList);
-      }
-      break;
-    }
-    case 10: {
-      D3D12_CPU_DESCRIPTOR_HANDLE uavs[] =
-      {
-          rtTarget.UAV,
-          wavefrontPathStateBuffer.UAV,
-          wavefrontRayQueueA.UAV,
-          wavefrontRayQueueB.UAV,
-          wavefrontShadowQueue.UAV,
-          wavefrontCounterBuffer.UAV,
-          wavefrontHitQueueA.UAV,
-          wavefrontHitQueueB.UAV,
-          wavefrontDispatchArgsBuffer.UAV,
-      };
-      DX12::BindTempDescriptorTable(cmdList, uavs, ArraySize_(uavs), RTParams_UAVDescriptor, CmdListMode::Compute);
-
-      // Clear all queue counters in one command before profiling the path.
-      clearWavefrontCounters();
-
-      if(g_wavefront_use_clear_uav == false)
-      {
-          ProfileBlock cursorPB(cmdList, "Wavefront Work Cursor Clear (Kernel)");
-          cmdList->SetPipelineState(wavefrontPreparePersistentBouncePSO);
-          DX12::CmdList->Dispatch(1, 1, 1);
-          wavefrontCounterBuffer.UAVBarrier(cmdList);
-      }
-
-      ProfileBlock pb(cmdList, "RayQuery Persistent Wavefront Global Queue Dispatch");
-
-      const uint32 width = uint32(rtTarget.Width());
-      const uint32 height = uint32(rtTarget.Height());
-      const uint32 numPixels = width * height;
-      const uint32 wavefrontThreadGroupSize = ActiveWavefrontThreadGroupSize();
-      const uint32 pixelGroups = (numPixels + wavefrontThreadGroupSize - 1) / wavefrontThreadGroupSize;
-      const uint32 persistentGroups = Clamp<uint32>(uint32(g_persistent_worker_groups), 1, Max<uint32>(pixelGroups, 1));
-      const uint32 gx = (width + 7) / 8;
-      const uint32 gy = (height + 7) / 8;
-
-      rtConstants.myFlags = 16u;
-      rtConstants.WavefrontReadQueue = 0;
-      rtConstants.WavefrontWriteQueue = 0;
-      rtConstants.WavefrontBounce = 0;
-      rtConstants.WavefrontPadding = Clamp<uint32>(uint32(g_persistent_batch_waves), 1, 8);
-      rtConstants.WavefrontThreadGroupSize = wavefrontThreadGroupSize;
-      DX12::BindTempConstantBuffer(cmdList, rtConstants, RTParams_CBuffer, CmdListMode::Compute);
-
-      {
-          ProfileBlock generatePB(cmdList, "Persistent Global Queue Generate Primary");
-          cmdList->SetPipelineState(wavefrontGeneratePrimaryPSO);
-          DX12::CmdList->Dispatch(gx, gy, 1);
-          wavefrontPathStateBuffer.UAVBarrier(cmdList);
-          wavefrontRayQueueA.UAVBarrier(cmdList);
-          wavefrontCounterBuffer.UAVBarrier(cmdList);
-      }
-
-      {
-          ProfileBlock workPB(cmdList, "Persistent Global Queue Workers");
-          cmdList->SetPipelineState(wavefrontPersistentWorkQueuePSOVariants[wavefrontVariantIdx]);
-          DX12::CmdList->Dispatch(persistentGroups, 1, 1);
-          wavefrontPathStateBuffer.UAVBarrier(cmdList);
-          wavefrontRayQueueA.UAVBarrier(cmdList);
-          wavefrontCounterBuffer.UAVBarrier(cmdList);
-      }
-
-      {
-          ProfileBlock accumulatePB(cmdList, "Persistent Global Queue Accumulate");
-          cmdList->SetPipelineState(wavefrontAccumulatePSO);
-          DX12::CmdList->Dispatch(gx, gy, 1);
-          wavefrontPathStateBuffer.UAVBarrier(cmdList);
-          rtTarget.UAVBarrier(cmdList);
-      }
-      break;
-    }
-    case 7: {
-      ProfileBlock pb(cmdList, "RayQuery Persistent Wavefront Dispatch");
-
-      static const char* PersistentPrepareProfileNames[] =
-      {
-          "Persistent Prepare B0",
-          "Persistent Prepare B1",
-          "Persistent Prepare B2",
-          "Persistent Prepare B3",
-          "Persistent Prepare B4",
-          "Persistent Prepare B5",
-          "Persistent Prepare B6",
-          "Persistent Prepare B7",
-      };
-
-      static const char* PersistentTraceShadeProfileNames[] =
-      {
-          "Persistent Trace+Shade B0",
-          "Persistent Trace+Shade B1",
-          "Persistent Trace+Shade B2",
-          "Persistent Trace+Shade B3",
-          "Persistent Trace+Shade B4",
-          "Persistent Trace+Shade B5",
-          "Persistent Trace+Shade B6",
-          "Persistent Trace+Shade B7",
-      };
-
-      static const char* PersistentPrepareArgsProfileNames[] =
-      {
-          "Persistent Prepare Args B0",
-          "Persistent Prepare Args B1",
-          "Persistent Prepare Args B2",
-          "Persistent Prepare Args B3",
-          "Persistent Prepare Args B4",
-          "Persistent Prepare Args B5",
-          "Persistent Prepare Args B6",
-          "Persistent Prepare Args B7",
-      };
-
-      static const char* PersistentTraceShadowProfileNames[] =
-      {
-          "Persistent Trace Shadows B0",
-          "Persistent Trace Shadows B1",
-          "Persistent Trace Shadows B2",
-          "Persistent Trace Shadows B3",
-          "Persistent Trace Shadows B4",
-          "Persistent Trace Shadows B5",
-          "Persistent Trace Shadows B6",
-          "Persistent Trace Shadows B7",
-      };
-
-      static const char* PersistentAdvanceProfileNames[] =
-      {
-          "Persistent Advance B0",
-          "Persistent Advance B1",
-          "Persistent Advance B2",
-          "Persistent Advance B3",
-          "Persistent Advance B4",
-          "Persistent Advance B5",
-          "Persistent Advance B6",
-          "Persistent Advance B7",
-      };
-
-      D3D12_CPU_DESCRIPTOR_HANDLE uavs[] =
-      {
-          rtTarget.UAV,
-          wavefrontPathStateBuffer.UAV,
-          wavefrontRayQueueA.UAV,
-          wavefrontRayQueueB.UAV,
-          wavefrontShadowQueue.UAV,
-          wavefrontCounterBuffer.UAV,
-          wavefrontHitQueueA.UAV,
-          wavefrontHitQueueB.UAV,
-          wavefrontDispatchArgsBuffer.UAV,
-      };
-      DX12::BindTempDescriptorTable(cmdList, uavs, ArraySize_(uavs), RTParams_UAVDescriptor, CmdListMode::Compute);
-
-      const uint32 width = uint32(rtTarget.Width());
-      const uint32 height = uint32(rtTarget.Height());
-      const uint32 numPixels = width * height;
-      const uint32 wavefrontThreadGroupSize = ActiveWavefrontThreadGroupSize();
-      const uint32 pixelGroups = (numPixels + wavefrontThreadGroupSize - 1) / wavefrontThreadGroupSize;
-      const uint32 persistentGroups = Clamp<uint32>(uint32(g_persistent_worker_groups), 1, Max<uint32>(pixelGroups, 1));
-      const uint32 gx = (width + 7) / 8;
-      const uint32 gy = (height + 7) / 8;
-      const uint64 dispatchArgsStride = sizeof(D3D12_DISPATCH_ARGUMENTS);
-      const uint64 shadowDispatchArgsOffset = 2 * dispatchArgsStride;
-      D3D12_RESOURCE_STATES dispatchArgsState = D3D12_RESOURCE_STATE_COMMON;
-
-      auto bindWavefrontConstants = [&](uint32 bounce, uint32 readQueue, uint32 writeQueue)
-      {
-          rtConstants.myFlags &= ~(2u | 4u);
-          rtConstants.WavefrontBounce = bounce;
-          rtConstants.WavefrontReadQueue = readQueue;
-          rtConstants.WavefrontWriteQueue = writeQueue;
-          rtConstants.WavefrontPadding = Clamp<uint32>(uint32(g_persistent_batch_waves), 1, 8);
-          DX12::BindTempConstantBuffer(cmdList, rtConstants, RTParams_CBuffer, CmdListMode::Compute);
-      };
-
-      auto preparePersistentDispatchArgs = [&](const char* profileName)
-      {
-          ProfileBlock preparePB(cmdList, profileName);
-
-          if(dispatchArgsState != D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
-          {
-              wavefrontDispatchArgsBuffer.Transition(cmdList, dispatchArgsState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-              dispatchArgsState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-          }
-
-          cmdList->SetPipelineState(wavefrontPrepareDispatchArgsPSO);
-          DX12::CmdList->Dispatch(1, 1, 1);
-          wavefrontDispatchArgsBuffer.UAVBarrier(cmdList);
-          wavefrontDispatchArgsBuffer.Transition(cmdList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
-          dispatchArgsState = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
-      };
-
-      bindWavefrontConstants(0, 0, 1);
-      clearWavefrontCounters();
-
-      {
-          ProfileBlock generatePB(cmdList, "Persistent Generate Primary");
-          cmdList->SetPipelineState(wavefrontGeneratePrimaryPSO);
-          DX12::CmdList->Dispatch(gx, gy, 1);
-          wavefrontPathStateBuffer.UAVBarrier(cmdList);
-          wavefrontRayQueueA.UAVBarrier(cmdList);
-          wavefrontCounterBuffer.UAVBarrier(cmdList);
-      }
-
-      uint32 currentQueue = 0;
-      for(uint32 bounce = 0; bounce < uint32(AppSettings::MaxPathLength); ++bounce)
-      {
-          const uint32 nextQueue = currentQueue ^ 1;
-          bindWavefrontConstants(bounce, currentQueue, nextQueue);
-
-          {
-              ProfileBlock preparePB(cmdList, PersistentPrepareProfileNames[bounce]);
-              cmdList->SetPipelineState(wavefrontPreparePersistentBouncePSO);
-              DX12::CmdList->Dispatch(1, 1, 1);
-              wavefrontCounterBuffer.UAVBarrier(cmdList);
-          }
-
-          {
-              ProfileBlock traceShadePB(cmdList, PersistentTraceShadeProfileNames[bounce]);
-              cmdList->SetPipelineState(wavefrontPersistentTraceShadePSOVariants[wavefrontVariantIdx]);
-              DX12::CmdList->Dispatch(persistentGroups, 1, 1);
-              wavefrontPathStateBuffer.UAVBarrier(cmdList);
-              wavefrontRayQueueA.UAVBarrier(cmdList);
-              wavefrontRayQueueB.UAVBarrier(cmdList);
-              wavefrontShadowQueue.UAVBarrier(cmdList);
-              wavefrontCounterBuffer.UAVBarrier(cmdList);
-          }
-
-          if(g_persistent_shadow_workers)
-          {
-              {
-                  ProfileBlock preparePB(cmdList, PersistentPrepareArgsProfileNames[bounce]);
-                  cmdList->SetPipelineState(wavefrontPreparePersistentBouncePSO);
-                  DX12::CmdList->Dispatch(1, 1, 1);
-                  wavefrontCounterBuffer.UAVBarrier(cmdList);
-              }
-
-              {
-                  ProfileBlock shadowPB(cmdList, PersistentTraceShadowProfileNames[bounce]);
-                  cmdList->SetPipelineState(wavefrontPersistentTraceShadowsPSOVariants[wavefrontVariantIdx]);
-                  DX12::CmdList->Dispatch(persistentGroups, 1, 1);
-                  wavefrontPathStateBuffer.UAVBarrier(cmdList);
-                  wavefrontCounterBuffer.UAVBarrier(cmdList);
-              }
-          }
-          else
-          {
-              preparePersistentDispatchArgs(PersistentPrepareArgsProfileNames[bounce]);
-
-              {
-                  ProfileBlock shadowPB(cmdList, PersistentTraceShadowProfileNames[bounce]);
-                  cmdList->SetPipelineState(wavefrontTraceShadowsPSOVariants[wavefrontVariantIdx]);
-                  cmdList->ExecuteIndirect(wavefrontDispatchCommandSignature, 1, wavefrontDispatchArgsBuffer.Resource(),
-                                           shadowDispatchArgsOffset, nullptr, 0);
-                  wavefrontPathStateBuffer.UAVBarrier(cmdList);
-                  wavefrontCounterBuffer.UAVBarrier(cmdList);
-              }
-          }
-
-          currentQueue = nextQueue;
-
-          {
-              ProfileBlock advancePB(cmdList, PersistentAdvanceProfileNames[bounce]);
-              cmdList->SetPipelineState(wavefrontAdvancePSO);
-              DX12::CmdList->Dispatch(1, 1, 1);
-              wavefrontCounterBuffer.UAVBarrier(cmdList);
-          }
-      }
-
-      bindWavefrontConstants(0, 0, 1);
-      {
-          ProfileBlock accumulatePB(cmdList, "Persistent Accumulate");
-          cmdList->SetPipelineState(wavefrontAccumulatePSO);
-          DX12::CmdList->Dispatch(gx, gy, 1);
-          wavefrontPathStateBuffer.UAVBarrier(cmdList);
-          rtTarget.UAVBarrier(cmdList);
-      }
-      break;
-    }
-    case 8: {
-      ProfileBlock pb(cmdList, "RayQuery Persistent Warps Dispatch");
-
-      D3D12_CPU_DESCRIPTOR_HANDLE uavs[] =
-      {
-          rtTarget.UAV,
-          wavefrontPathStateBuffer.UAV,
-          wavefrontRayQueueA.UAV,
-          wavefrontRayQueueB.UAV,
-          wavefrontShadowQueue.UAV,
-          wavefrontCounterBuffer.UAV,
-          wavefrontHitQueueA.UAV,
-          wavefrontHitQueueB.UAV,
-          wavefrontDispatchArgsBuffer.UAV,
-      };
-      DX12::BindTempDescriptorTable(cmdList, uavs, ArraySize_(uavs), RTParams_UAVDescriptor, CmdListMode::Compute);
-
-      const uint32 width = uint32(rtTarget.Width());
-      const uint32 height = uint32(rtTarget.Height());
-      const uint32 numPixels = width * height;
-      const uint32 wavefrontThreadGroupSize = ActiveWavefrontThreadGroupSize();
-      const uint32 pixelGroups = (numPixels + wavefrontThreadGroupSize - 1) / wavefrontThreadGroupSize;
-      const uint32 persistentGroups = Clamp<uint32>(uint32(g_persistent_worker_groups), 1, Max<uint32>(pixelGroups, 1));
-
-      rtConstants.myFlags &= ~(2u | 4u);
-      rtConstants.WavefrontBounce = 0;
-      rtConstants.WavefrontReadQueue = 0;
-      rtConstants.WavefrontWriteQueue = 1;
-      rtConstants.WavefrontPadding = Clamp<uint32>(uint32(g_persistent_batch_waves), 1, 8);
-      DX12::BindTempConstantBuffer(cmdList, rtConstants, RTParams_CBuffer, CmdListMode::Compute);
-
-      clearWavefrontCounters();
-
-      {
-          ProfileBlock preparePB(cmdList, "Persistent Warps Prepare");
-          cmdList->SetPipelineState(wavefrontPreparePersistentBouncePSO);
-          DX12::CmdList->Dispatch(1, 1, 1);
-          wavefrontCounterBuffer.UAVBarrier(cmdList);
-      }
-
-      {
-          ProfileBlock tracePB(cmdList, "Persistent Warps Path Trace");
-          cmdList->SetPipelineState(persistentWarpsPathTracePSOVariants[wavefrontVariantIdx]);
-          DX12::CmdList->Dispatch(persistentGroups, 1, 1);
-          wavefrontCounterBuffer.UAVBarrier(cmdList);
-          rtTarget.UAVBarrier(cmdList);
-      }
-      break;
-    }
-    }
-
     rtTarget.MakeReadableUAV(cmdList);
 
     rtCurrSampleIdx += 1;

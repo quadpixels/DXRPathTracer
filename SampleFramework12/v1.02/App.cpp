@@ -12,6 +12,7 @@
 #include "App.h"
 #include "Exceptions.h"
 #include "Graphics\\Profiler.h"
+#include "Graphics\\DX12.h"
 #include "Graphics\\Spectrum.h"
 #include "SF12_Math.h"
 #include "FileIO.h"
@@ -74,6 +75,20 @@ int32 App::Run()
 
             window.MessageLoop();
         }
+    }
+    catch(SampleFramework12::DXException exception)
+    {
+        std::wstring message = exception.GetMessage();
+        if(SampleFramework12::DX12::Device != nullptr &&
+           (exception.GetErrorCode() == DXGI_ERROR_DEVICE_REMOVED ||
+            exception.GetErrorCode() == DXGI_ERROR_DEVICE_HUNG ||
+            exception.GetErrorCode() == DXGI_ERROR_DEVICE_RESET))
+        {
+            message += L"\n\n";
+            message += SampleFramework12::DX12::GetDeviceRemovedDiagnostics();
+        }
+        SampleFramework12::Exception(message).ShowErrorMessage();
+        return -1;
     }
     catch(SampleFramework12::Exception exception)
     {
