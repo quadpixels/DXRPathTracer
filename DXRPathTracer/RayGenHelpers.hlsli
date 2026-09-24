@@ -7,12 +7,59 @@ struct RayGenWorkInfo
     uint TileCountX;
     uint TileCountY;
     uint TileArea;
+    uint TileWorkItemCount;
+    uint LocalWorkItemCount;
     uint StaticWorkItemLimit;
     uint AtomicWorkItemCount;
     uint StaticWorkItemStep;
     bool Tiled;
     bool Atomic;
+    bool ZCurveTiles;
+    bool ZCurveLocal;
 };
+
+static uint RayGenMortonBitCount(in uint value)
+{
+    uint bits = 0u;
+    value = max(value, 1u) - 1u;
+    while(value > 0u)
+    {
+        ++bits;
+        value >>= 1u;
+    }
+    return bits;
+}
+
+static uint RayGenMortonDomainSize(in uint width, in uint height)
+{
+    return 1u << (RayGenMortonBitCount(width) + RayGenMortonBitCount(height));
+}
+
+static uint2 RayGenDecodeMorton2D(in uint code, in uint width, in uint height)
+{
+    const uint xBits = RayGenMortonBitCount(width);
+    const uint yBits = RayGenMortonBitCount(height);
+    const uint maxBits = max(xBits, yBits);
+    uint x = 0u;
+    uint y = 0u;
+    uint sourceBit = 0u;
+
+    for(uint bit = 0u; bit < maxBits; ++bit)
+    {
+        if(bit < xBits)
+        {
+            x |= ((code >> sourceBit) & 1u) << bit;
+            ++sourceBit;
+        }
+        if(bit < yBits)
+        {
+            y |= ((code >> sourceBit) & 1u) << bit;
+            ++sourceBit;
+        }
+    }
+
+    return uint2(x, y);
+}
 
 static RayGenWorkInfo MakeRayGenWorkInfo(uint3 dispatchIndex)
 {
@@ -26,11 +73,15 @@ static RayGenWorkInfo MakeRayGenWorkInfo(uint3 dispatchIndex)
     info.DispatchStride = dispatchWidth * dispatchHeight;
     info.Tiled = (RayTraceCB.myFlags & 16u) != 0u;
     info.Atomic = (RayTraceCB.myFlags & 64u) != 0u;
+    info.ZCurveTiles = (RayTraceCB.myFlags & 128u) != 0u;
+    info.ZCurveLocal = (RayTraceCB.myFlags & 256u) != 0u;
     info.TileCountX = (RayTraceCB.DispatchWidth + dispatchWidth - 1u) / dispatchWidth;
     info.TileCountY = (RayTraceCB.DispatchHeight + dispatchHeight - 1u) / dispatchHeight;
     info.TileArea = dispatchWidth * dispatchHeight;
-    info.StaticWorkItemLimit = info.Tiled ? info.TileCountX * info.TileCountY : RayTraceCB.TotalNumPixels;
-    info.AtomicWorkItemCount = info.Tiled ? info.TileCountX * info.TileCountY * info.TileArea : RayTraceCB.TotalNumPixels;
+    info.TileWorkItemCount = info.ZCurveTiles ? RayGenMortonDomainSize(info.TileCountX, info.TileCountY) : info.TileCountX * info.TileCountY;
+    info.LocalWorkItemCount = info.ZCurveLocal ? RayGenMortonDomainSize(dispatchWidth, dispatchHeight) : info.TileArea;
+    info.StaticWorkItemLimit = info.Tiled ? info.TileWorkItemCount : RayTraceCB.TotalNumPixels;
+    info.AtomicWorkItemCount = info.Tiled ? info.TileWorkItemCount * info.LocalWorkItemCount : RayTraceCB.TotalNumPixels;
     info.StaticWorkItemStep = info.Tiled ? 1u : info.DispatchStride;
     return info;
 }
@@ -54,29 +105,21 @@ static bool AcquireRayGenWork(in RayGenWorkInfo info, inout uint workItem)
     return workItem < info.StaticWorkItemLimit;
 }
 
-static bool ResolveRayGenPixel(in RayGenWorkInfo info, uint workItem, out uint pixelIdx, out uint2 pixelCoord)
+static bool ResolveRayGenPixel(in RayGenWorkInfo info, uint tileWorkItem, uint localWorkItem,
+                               out uint pixelIdx, out uint2 pixelCoord)
 {
     pixelIdx = 0;
     pixelCoord = 0;
     if(info.Tiled)
     {
-        if(info.Atomic)
-        {
-            const uint tileLinearIdx = workItem / info.TileArea;
-            const uint localIdx = workItem % info.TileArea;
-            const uint tileX = tileLinearIdx % info.TileCountX;
-            const uint tileY = tileLinearIdx / info.TileCountX;
-            pixelCoord = uint2(localIdx % info.DispatchWidth, localIdx / info.DispatchWidth) +
-                         uint2(tileX * info.DispatchWidth, tileY * info.DispatchHeight);
-        }
-        else
-        {
-            const uint tileX = workItem % info.TileCountX;
-            const uint tileY = workItem / info.TileCountX;
-            const uint2 dispatchIndex = uint2(info.DispatchIndex % info.DispatchWidth,
-                                              info.DispatchIndex / info.DispatchWidth);
-            pixelCoord = dispatchIndex + uint2(tileX * info.DispatchWidth, tileY * info.DispatchHeight);
-        }
+        if(tileWorkItem >= info.TileWorkItemCount || localWorkItem >= info.LocalWorkItemCount)
+            return false;
+
+        const uint2 tileCoord = info.ZCurveTiles ? RayGenDecodeMorton2D(tileWorkItem, info.TileCountX, info.TileCountY) :
+                                                   uint2(tileWorkItem % info.TileCountX, tileWorkItem / info.TileCountX);
+        const uint2 localCoord = info.ZCurveLocal ? RayGenDecodeMorton2D(localWorkItem, info.DispatchWidth, info.DispatchHeight) :
+                                                   uint2(localWorkItem % info.DispatchWidth, localWorkItem / info.DispatchWidth);
+        pixelCoord = localCoord + tileCoord * uint2(info.DispatchWidth, info.DispatchHeight);
 
         if(pixelCoord.x >= RayTraceCB.DispatchWidth || pixelCoord.y >= RayTraceCB.DispatchHeight)
             return false;
@@ -85,7 +128,7 @@ static bool ResolveRayGenPixel(in RayGenWorkInfo info, uint workItem, out uint p
         return true;
     }
 
-    pixelIdx = workItem;
+    pixelIdx = tileWorkItem;
     pixelCoord = uint2(pixelIdx % RayTraceCB.DispatchWidth, pixelIdx / RayTraceCB.DispatchWidth);
     return true;
 }

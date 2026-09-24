@@ -168,18 +168,18 @@ void App::ParseCommandLine(const wchar* cmdLine)
     for(uint64 i = 0; i < numParts; ++i)
         partStrings[i + 1] = &parts[i].front();
 
-    int32 argc = int32(numParts + 1);
-    char** argv = partStrings.Data();
+//    int32 argc = int32(numParts + 1);
+//    char** argv = partStrings.Data();
 
-    cxxopts::Options options("App", "");
-    options.allow_unrecognised_options();
-    options.add_options()
-         ("a,adapter", "GPU adapter index", cxxopts::value<int32>());
+//    cxxopts::Options options("App", "");
+//    options.allow_unrecognised_options();
+//    options.add_options()
+//         ("a,adapter", "GPU adapter index", cxxopts::value<int32>());
 
-    cxxopts::ParseResult parseResult = options.parse(argc, argv);
+//    cxxopts::ParseResult parseResult = options.parse(argc, argv);
 
-    if(parseResult.count("adapter"))
-        adapterIdx = parseResult["adapter"].as<int32>();
+//    if(parseResult.count("adapter"))
+//        adapterIdx = parseResult["adapter"].as<int32>();
 }
 
 void App::Initialize_Internal()

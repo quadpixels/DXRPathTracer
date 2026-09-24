@@ -160,6 +160,9 @@ static const uint RayTraceFlag_EnableWavefrontReorder = 2u;
 static const uint RayTraceFlag_EnableWavefrontBlockSort = 4u;
 static const uint RayTraceFlag_EnableWavefrontWaveAppend = 8u;
 static const uint RayTraceFlag_PersistentUnifiedQueue = 16u;
+static const uint RayTraceFlag_PersistentTiled = 128u;
+static const uint RayTraceFlag_PersistentTiledZCurveTiles = 256u;
+static const uint RayTraceFlag_PersistentTiledZCurveLocal = 512u;
 static const uint NumReorderBins = 64u;
 static const uint DispatchArgs_CurrentRays = 0u;
 static const uint DispatchArgs_Hits = 1u;
@@ -590,18 +593,99 @@ void WavefrontClearCS(uint3 dispatchThreadID : SV_DispatchThreadID)
         WavefrontCounters[dispatchThreadID.x] = 0;
 }
 
-[numthreads(8, 8, 1)]
-void WavefrontGeneratePrimaryCS(uint3 dispatchThreadID : SV_DispatchThreadID)
+static uint MortonBitCount(in uint value)
 {
-    int width;
-    int height;
-    RenderTarget.GetDimensions(width, height);
+    uint bits = 0u;
+    value = max(value, 1u) - 1u;
+    while(value > 0u)
+    {
+        ++bits;
+        value >>= 1u;
+    }
+    return bits;
+}
 
-    const uint2 pixelCoord = dispatchThreadID.xy;
-    if(pixelCoord.x >= uint(width) || pixelCoord.y >= uint(height))
-        return;
+static uint MortonDomainSize(in uint width, in uint height)
+{
+    return 1u << (MortonBitCount(width) + MortonBitCount(height));
+}
 
-    const uint pixelIdx = pixelCoord.y * uint(width) + pixelCoord.x;
+static uint2 DecodeMorton2D(in uint code, in uint width, in uint height)
+{
+    const uint xBits = MortonBitCount(width);
+    const uint yBits = MortonBitCount(height);
+    const uint maxBits = max(xBits, yBits);
+    uint x = 0u;
+    uint y = 0u;
+    uint sourceBit = 0u;
+
+    for(uint bit = 0u; bit < maxBits; ++bit)
+    {
+        if(bit < xBits)
+        {
+            x |= ((code >> sourceBit) & 1u) << bit;
+            ++sourceBit;
+        }
+        if(bit < yBits)
+        {
+            y |= ((code >> sourceBit) & 1u) << bit;
+            ++sourceBit;
+        }
+    }
+
+    return uint2(x, y);
+}
+
+static uint PersistentTiledWorkItemCount(in uint width, in uint height)
+{
+    const uint tileWidth = max(RayTraceCB.WavefrontThreadGroupSize, 1u);
+    const uint tileHeight = max(RayTraceCB.PersistentWorkerCount / tileWidth, 1u);
+    const uint tileCountX = (width + tileWidth - 1u) / tileWidth;
+    const uint tileCountY = (height + tileHeight - 1u) / tileHeight;
+    const bool zCurveTiles = (RayTraceCB.myFlags & RayTraceFlag_PersistentTiledZCurveTiles) != 0u;
+    const bool zCurveLocal = (RayTraceCB.myFlags & RayTraceFlag_PersistentTiledZCurveLocal) != 0u;
+    const uint tileWorkItemCount = zCurveTiles ? MortonDomainSize(tileCountX, tileCountY) : tileCountX * tileCountY;
+    const uint localWorkItemCount = zCurveLocal ? MortonDomainSize(tileWidth, tileHeight) : tileWidth * tileHeight;
+    return tileWorkItemCount * localWorkItemCount;
+}
+
+static bool ResolvePersistentTiledPixel(in uint workItem, in uint width, in uint height,
+                                        out uint pixelIdx, out uint2 pixelCoord)
+{
+    const uint tileWidth = max(RayTraceCB.WavefrontThreadGroupSize, 1u);
+    const uint tileHeight = max(RayTraceCB.PersistentWorkerCount / tileWidth, 1u);
+    const uint tileCountX = (width + tileWidth - 1u) / tileWidth;
+    const uint tileCountY = (height + tileHeight - 1u) / tileHeight;
+    const bool zCurveTiles = (RayTraceCB.myFlags & RayTraceFlag_PersistentTiledZCurveTiles) != 0u;
+    const bool zCurveLocal = (RayTraceCB.myFlags & RayTraceFlag_PersistentTiledZCurveLocal) != 0u;
+    const uint tileWorkItemCount = zCurveTiles ? MortonDomainSize(tileCountX, tileCountY) : tileCountX * tileCountY;
+    const uint localWorkItemCount = zCurveLocal ? MortonDomainSize(tileWidth, tileHeight) : tileWidth * tileHeight;
+    if(workItem >= tileWorkItemCount * localWorkItemCount)
+    {
+        pixelIdx = 0u;
+        pixelCoord = 0u;
+        return false;
+    }
+
+    const uint tileWorkItem = workItem / localWorkItemCount;
+    const uint localWorkItem = workItem % localWorkItemCount;
+    const uint2 tileCoord = zCurveTiles ? DecodeMorton2D(tileWorkItem, tileCountX, tileCountY) :
+                                          uint2(tileWorkItem % tileCountX, tileWorkItem / tileCountX);
+    const uint2 localCoord = zCurveLocal ? DecodeMorton2D(localWorkItem, tileWidth, tileHeight) :
+                                           uint2(localWorkItem % tileWidth, localWorkItem / tileWidth);
+    pixelCoord = localCoord + tileCoord * uint2(tileWidth, tileHeight);
+    if(pixelCoord.x >= width || pixelCoord.y >= height)
+    {
+        pixelIdx = 0u;
+        return false;
+    }
+
+    pixelIdx = pixelCoord.y * width + pixelCoord.x;
+    return true;
+}
+
+static void GeneratePrimaryRay(in uint pixelIdx, in uint2 pixelCoord, in uint queueIdx, in uint width, in uint height)
+{
     uint sampleSetIdx = 0;
 
     float2 primaryRaySample = SamplePoint(pixelIdx, sampleSetIdx);
@@ -637,10 +721,51 @@ void WavefrontGeneratePrimaryCS(uint3 dispatchThreadID : SV_DispatchThreadID)
     state.Padding = 0.0f;
 
     PathStates[pixelIdx] = state;
-    RayQueueA[pixelIdx] = ray;
+    RayQueueA[queueIdx] = ray;
 
-    if(pixelIdx == 0)
-        WavefrontCounters[Counter_CurrentRays] = RayTraceCB.TotalNumPixels;
+}
+
+[numthreads(8, 8, 1)]
+void WavefrontGeneratePrimaryCS(uint3 dispatchThreadID : SV_DispatchThreadID)
+{
+    int targetWidth;
+    int targetHeight;
+    RenderTarget.GetDimensions(targetWidth, targetHeight);
+
+    const uint width = uint(targetWidth);
+    const uint height = uint(targetHeight);
+
+    if((RayTraceCB.myFlags & RayTraceFlag_PersistentTiled) != 0u)
+    {
+        const uint paddedWidth = ((width + 7u) / 8u) * 8u;
+        const uint paddedHeight = ((height + 7u) / 8u) * 8u;
+        const uint generatorStride = paddedWidth * paddedHeight;
+        const uint initialWorkItem = dispatchThreadID.y * paddedWidth + dispatchThreadID.x;
+        const uint workItemCount = PersistentTiledWorkItemCount(width, height);
+
+        for(uint workItem = initialWorkItem; workItem < workItemCount; workItem += generatorStride)
+        {
+            uint pixelIdx;
+            uint2 pixelCoord;
+            if(ResolvePersistentTiledPixel(workItem, width, height, pixelIdx, pixelCoord))
+            {
+                const uint queueIdx = AllocateQueueIndex(Counter_CurrentRays, true);
+                GeneratePrimaryRay(pixelIdx, pixelCoord, queueIdx, width, height);
+            }
+        }
+    }
+    else
+    {
+        const uint2 pixelCoord = dispatchThreadID.xy;
+        if(pixelCoord.x >= width || pixelCoord.y >= height)
+            return;
+
+        const uint pixelIdx = pixelCoord.y * width + pixelCoord.x;
+        GeneratePrimaryRay(pixelIdx, pixelCoord, pixelIdx, width, height);
+
+        if(pixelIdx == 0)
+            WavefrontCounters[Counter_CurrentRays] = RayTraceCB.TotalNumPixels;
+    }
 }
 
 [numthreads(WAVEFRONT_THREAD_GROUP_SIZE, 1, 1)]
@@ -1227,15 +1352,29 @@ void PersistentWarpsPathTraceCS(uint3 dispatchThreadID : SV_DispatchThreadID)
     int height;
     RenderTarget.GetDimensions(width, height);
 
-    if((RayTraceCB.myFlags & 32u) != 0u)
+    const bool staticStride = (RayTraceCB.myFlags & 32u) != 0u;
+    const bool tiled = (RayTraceCB.myFlags & RayTraceFlag_PersistentTiled) != 0u;
+    const uint workItemCount = tiled ? PersistentTiledWorkItemCount(uint(width), uint(height)) : RayTraceCB.TotalNumPixels;
+
+    if(staticStride)
     {
         const uint workerCount = max(RayTraceCB.PersistentWorkerCount, 1u);
-        for(uint pixelIdx = dispatchThreadID.x;
-            pixelIdx < RayTraceCB.TotalNumPixels;
-            pixelIdx += workerCount)
+        for(uint workItem = dispatchThreadID.x;
+            workItem < workItemCount;
+            workItem += workerCount)
         {
-            const uint2 pixelCoord = uint2(pixelIdx % uint(width), pixelIdx / uint(width));
-            TraceFullPathForPixel(pixelIdx, pixelCoord, uint(width), uint(height));
+            uint pixelIdx;
+            uint2 pixelCoord;
+            bool validWork = true;
+            if(tiled)
+                validWork = ResolvePersistentTiledPixel(workItem, uint(width), uint(height), pixelIdx, pixelCoord);
+            else
+            {
+                pixelIdx = workItem;
+                pixelCoord = uint2(pixelIdx % uint(width), pixelIdx / uint(width));
+            }
+            if(validWork)
+                TraceFullPathForPixel(pixelIdx, pixelCoord, uint(width), uint(height));
         }
     }
     else
@@ -1252,19 +1391,30 @@ void PersistentWarpsPathTraceCS(uint3 dispatchThreadID : SV_DispatchThreadID)
                 InterlockedAdd(WavefrontCounters[Counter_WorkCursor], batchSize, waveBaseIdx);
 
             waveBaseIdx = WaveReadLaneFirst(waveBaseIdx);
-            const bool batchHasWork = waveBaseIdx < RayTraceCB.TotalNumPixels;
+            const bool batchHasWork = waveBaseIdx < workItemCount;
 
             if(WaveActiveAnyTrue(batchHasWork) == false)
                 break;
 
             for(uint batchWave = 0; batchWave < batchWaves; ++batchWave)
             {
-                const uint pixelIdx = waveBaseIdx + batchWave * waveSize + laneIdx;
-                const bool validWork = pixelIdx < RayTraceCB.TotalNumPixels;
+                const uint workItem = waveBaseIdx + batchWave * waveSize + laneIdx;
+                uint pixelIdx;
+                uint2 pixelCoord;
+                bool validWork = workItem < workItemCount;
+                if(validWork)
+                {
+                    if(tiled)
+                        validWork = ResolvePersistentTiledPixel(workItem, uint(width), uint(height), pixelIdx, pixelCoord);
+                    else
+                    {
+                        pixelIdx = workItem;
+                        pixelCoord = uint2(pixelIdx % uint(width), pixelIdx / uint(width));
+                    }
+                }
 
                 if(validWork)
                 {
-                    const uint2 pixelCoord = uint2(pixelIdx % uint(width), pixelIdx / uint(width));
                     TraceFullPathForPixel(pixelIdx, pixelCoord, uint(width), uint(height));
                 }
             }

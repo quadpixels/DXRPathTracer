@@ -24,8 +24,12 @@ extern bool g_wavefront_block_sort;
 extern bool g_wavefront_wave_append;
 extern bool g_wavefront_use_clear_uav;
 extern bool g_persistent_shadow_workers;
+extern bool g_persistent_tiled;
+extern int g_persistent_tiled_order;
 extern int g_persistent_worker_groups;
 extern int g_persistent_worker_groups_actual;
+extern int g_persistent_raygen_max_work_items;
+extern int g_persistent_raygen_dispatch_count;
 extern int g_persistent_batch_waves;
 extern int g_wavefront_thread_group_size;
 extern void ApplyPreset(int preset);
@@ -912,6 +916,18 @@ void SettingsContainer::Update(uint32 displayWidth, uint32 displayHeight, const 
         }
     }
     ImGui::Checkbox("Persistent Shadow Workers", &g_persistent_shadow_workers);
+    ImGui::Checkbox("Persistent Tiled Work Distribution", &g_persistent_tiled);
+    if(g_persistent_tiled || g_render_path == 13 || g_render_path == 16)
+    {
+        static const char* PersistentTiledOrderNames[] =
+        {
+            "Linear",
+            "Z-Curve Tiles And Local Work",
+            "Z-Curve Local Work Only",
+        };
+        ImGui::Combo("Persistent Tiled Order", &g_persistent_tiled_order,
+                     PersistentTiledOrderNames, ArraySize_(PersistentTiledOrderNames));
+    }
     {
         static const int WorkerGroupPresets[] = { 8, 16, 32, 64, 128, 256, 512, 1024, 2048 };
         static int pendingWorkerGroups = 0;
@@ -947,6 +963,13 @@ void SettingsContainer::Update(uint32 displayWidth, uint32 displayHeight, const 
             ImGui::Text("Actual Persistent Worker Groups: %d", g_persistent_worker_groups_actual);
         else
             ImGui::Text("Actual Persistent Worker Groups: inactive");
+
+        ImGui::InputInt("Atomic Persistent Work Items Per Thread", &g_persistent_raygen_max_work_items);
+        g_persistent_raygen_max_work_items = Clamp(g_persistent_raygen_max_work_items, 1, 64);
+        if(g_persistent_raygen_dispatch_count > 0)
+            ImGui::Text("Atomic Persistent DispatchRays Calls: %d", g_persistent_raygen_dispatch_count);
+        else
+            ImGui::Text("Atomic Persistent DispatchRays Calls: inactive");
     }
     ImGui::SliderInt("Persistent Batch Waves", &g_persistent_batch_waves, 1, 8);
     ImGui::RadioButton("DXR1.0 (original)", &g_render_path, 0);

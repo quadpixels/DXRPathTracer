@@ -111,21 +111,40 @@ void RaygenShader()
 {
     const uint3 dispatchIndex = DispatchRaysIndex();
     const RayGenWorkInfo workInfo = MakeRayGenWorkInfo(dispatchIndex);
-    uint workItem = workInfo.Atomic ? 0u : (workInfo.Tiled ? 0u : workInfo.DispatchIndex);
-
-    uint iterations = 0;
-    while((!workInfo.Atomic || iterations < RayTraceCB.PersistentRayGenMaxIterations) &&
-          AcquireRayGenWork(workInfo, workItem))
+    if(workInfo.Tiled && workInfo.Atomic == false)
     {
-        uint pixelIdx;
-        uint2 pixelCoord;
-        if(ResolveRayGenPixel(workInfo, workItem, pixelIdx, pixelCoord))
-            TraceRayGenPixel(pixelIdx, pixelCoord);
+        for(uint tileWorkItem = 0u; tileWorkItem < workInfo.StaticWorkItemLimit; ++tileWorkItem)
+        {
+            for(uint localWorkItem = workInfo.DispatchIndex;
+                localWorkItem < workInfo.LocalWorkItemCount;
+                localWorkItem += workInfo.DispatchStride)
+            {
+                uint pixelIdx;
+                uint2 pixelCoord;
+                if(ResolveRayGenPixel(workInfo, tileWorkItem, localWorkItem, pixelIdx, pixelCoord))
+                    TraceRayGenPixel(pixelIdx, pixelCoord);
+            }
+        }
+    }
+    else
+    {
+        uint workItem = workInfo.Atomic ? 0u : workInfo.DispatchIndex;
+        uint iterations = 0u;
+        while((!workInfo.Atomic || iterations < RayTraceCB.PersistentRayGenMaxIterations) &&
+              AcquireRayGenWork(workInfo, workItem))
+        {
+            uint pixelIdx;
+            uint2 pixelCoord;
+            const uint tileWorkItem = workInfo.Tiled ? workItem / workInfo.LocalWorkItemCount : workItem;
+            const uint localWorkItem = workInfo.Tiled ? workItem % workInfo.LocalWorkItemCount : 0u;
+            if(ResolveRayGenPixel(workInfo, tileWorkItem, localWorkItem, pixelIdx, pixelCoord))
+                TraceRayGenPixel(pixelIdx, pixelCoord);
 
-        if(!workInfo.Atomic)
-            workItem += workInfo.StaticWorkItemStep;
+            if(!workInfo.Atomic)
+                workItem += workInfo.StaticWorkItemStep;
 
-        ++iterations;
+            ++iterations;
+        }
     }
 }
 static float3 PathTrace(in MeshVertex hitSurface, in Material material, in PrimaryPayload inPayload)

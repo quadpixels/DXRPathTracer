@@ -74,6 +74,8 @@ protected:
     ID3D12PipelineState* resolvePSO = nullptr;
 
     bool32 stablePowerState = false;
+    uint64 maxFramesToRender = 0;
+    uint64 renderedFrameCount = 0;
 
     // Ray tracing resources
     CompiledShaderPtr rayTraceLib;

@@ -33,11 +33,16 @@
           DX12::BindTempDescriptorTable(cmdList, atomicPersistentUAVs, ArraySize_(atomicPersistentUAVs),
                                         RTParams_UAVDescriptor, CmdListMode::Compute);
 
-          constexpr uint32 maxRayGenIterations = 4;
+          const uint32 maxRayGenIterations = uint32(Max<int>(g_persistent_raygen_max_work_items, 1));
           const uint64 workerCount = uint64(dispatchDesc.Width) * uint64(dispatchDesc.Height);
-          const uint64 totalWorkItems = uint64(rtTarget.Width()) * uint64(rtTarget.Height());
+          const uint64 tileCountX = (uint64(rtTarget.Width()) + dispatchDesc.Width - 1) / dispatchDesc.Width;
+          const uint64 tileCountY = (uint64(rtTarget.Height()) + dispatchDesc.Height - 1) / dispatchDesc.Height;
+          const uint64 totalWorkItems = tiledPersistentWarp ?
+              tileCountX * tileCountY * workerCount :
+              uint64(rtTarget.Width()) * uint64(rtTarget.Height());
           const uint32 dispatchCount = uint32((totalWorkItems + workerCount * maxRayGenIterations - 1) /
                                                (workerCount * maxRayGenIterations)) + 1;
+          g_persistent_raygen_dispatch_count = int(dispatchCount);
 
           rtConstants.PersistentRayGenMaxIterations = maxRayGenIterations;
           DX12::BindTempConstantBuffer(cmdList, rtConstants, RTParams_CBuffer, CmdListMode::Compute);

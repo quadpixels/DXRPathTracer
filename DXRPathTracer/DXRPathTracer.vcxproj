@@ -152,6 +152,7 @@
     <None Include="RayTracingPath_RayQuery.inl" />
     <None Include="RayTracingPath_Wavefront.inl" />
     <None Include="RayTracingPath_Persistent.inl" />
+    <None Include="RayTracingPath_PersistentWavefront.inl" />
     <None Include="RayTracingPath_DXR10Recursive.inl" />
     <None Include="RayTracingPath_DXR10SER.inl" />
     <None Include="RayTracingPath_DXR10LoopSER.inl" />

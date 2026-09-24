@@ -38,6 +38,8 @@ extern bool g_wavefront_block_sort;
 extern bool g_wavefront_wave_append;
 extern bool g_wavefront_use_clear_uav;
 extern bool g_persistent_shadow_workers;
+extern bool g_persistent_tiled;
+extern int g_persistent_tiled_order;
 extern int g_persistent_worker_groups;
 extern int g_persistent_batch_waves;
 extern int g_wavefront_thread_group_size;
@@ -69,7 +71,12 @@ StaticAssert_(ArraySize_(SceneSunDirections) == uint64(Scenes::NumValues));
 int g_render_path = 0;  // 0=DXR1.0 original, 1=DXR1.0 SER, 2=DXR1.0 loop SER, 3=DXR1.0 loop my, 4=DXR1.1 recursion, 5=DXR1.1 loop, 6=DXR1.1 wavefront, 7=DXR1.1 persistent wavefront, 8=DXR1.1 persistent warps, 9=DXR1.1 GPU wavefront, 10=DXR1.1 persistent wavefront global queue, 11=DXR1.0 persistent warp, 12=DXR1.0+1.1 RayQuery persistent warp, 13=DXR1.0 tiled persistent warp
 int g_wavefront_thread_group_size = 64;
 int g_persistent_worker_groups_actual = 0;
+int g_persistent_raygen_max_work_items = 4;
+int g_persistent_raygen_dispatch_count = 0;
+bool g_persistent_tiled = false;
+int g_persistent_tiled_order = 0;
 static int g_commandLinePreset = 0;
+static uint64 g_commandLineNumFrames = 0;
 
 void ApplyPreset(int preset)
 {
@@ -307,7 +314,8 @@ float Pow5(const float x)
     return xx * xx * x;
 }
 
-DXRPathTracer::DXRPathTracer(const wchar* cmdLine) : App(L"DXR Path Tracer", cmdLine)
+DXRPathTracer::DXRPathTracer(const wchar* cmdLine) : App(L"DXR Path Tracer", cmdLine),
+                                                     maxFramesToRender(g_commandLineNumFrames)
 {
     minFeatureLevel = D3D_FEATURE_LEVEL_11_1;
     globalHelpText = "DXR Path Tracer\n\n"
@@ -1520,6 +1528,10 @@ void DXRPathTracer::Render(const Timer& timer)
     DX12::SetViewport(cmdList, swapChain.Width(), swapChain.Height());
 
     RenderHUD(timer);
+
+    if (maxFramesToRender > 0 && ++renderedFrameCount >= maxFramesToRender) {
+      window.Destroy();
+    }
 }
 
 void DXRPathTracer::UpdateLights()
@@ -1842,8 +1854,12 @@ void DXRPathTracer::RenderRayTracing()
     if (g_wavefront_wave_append) {
       rtConstants.myFlags |= 8;
     }
-    if (g_render_path == 13) {
+    if (g_render_path == 13 || g_render_path == 16) {
       rtConstants.myFlags |= 16;
+      if(g_persistent_tiled_order == 1)
+          rtConstants.myFlags |= 128u | 256u;
+      else if(g_persistent_tiled_order == 2)
+          rtConstants.myFlags |= 256u;
     }
     if (g_render_path == 14) {
       rtConstants.myFlags |= 32;
@@ -1898,7 +1914,9 @@ void DXRPathTracer::RenderRayTracing()
         activeRenderPath = 5;
 
     g_persistent_worker_groups_actual = 0;
-    if(activeRenderPath == 11 || activeRenderPath == 12 || activeRenderPath == 13 ||
+    g_persistent_raygen_dispatch_count = 0;
+    if(activeRenderPath == 7 || activeRenderPath == 8 || activeRenderPath == 10 ||
+       activeRenderPath == 11 || activeRenderPath == 12 || activeRenderPath == 13 ||
        activeRenderPath == 14 || activeRenderPath == 15 || activeRenderPath == 16)
     {
         const uint32 requestedGroups = uint32(Max<int>(g_persistent_worker_groups, 1));
@@ -1907,14 +1925,21 @@ void DXRPathTracer::RenderRayTracing()
         // Atomic DXR 1.0 RayGen workers process the pixel pool in a loop.
         // Avoid configurations that make each worker process an excessive
         // number of TraceRay calls and are likely to hit the OS TDR timeout.
-        if(activeRenderPath == 15)
+        if(activeRenderPath == 15 || activeRenderPath == 16)
         {
             const uint64 totalPixels = uint64(rtTarget.Width()) * uint64(rtTarget.Height());
             const uint32 workerWidth = Max<uint32>(ActiveWavefrontThreadGroupSize(), 1);
-            const uint64 maxWorkItemsPerWorker = 16;
+            const uint64 maxWorkItemsPerWorker = uint64(Max<int>(g_persistent_raygen_max_work_items, 1));
             const uint64 minimumWorkers = (totalPixels + maxWorkItemsPerWorker - 1) / maxWorkItemsPerWorker;
             const uint32 minimumGroups = uint32((minimumWorkers + workerWidth - 1) / workerWidth);
             effectiveGroups = Max(effectiveGroups, minimumGroups);
+        }
+
+        if(activeRenderPath == 7 || activeRenderPath == 8 || activeRenderPath == 10 || activeRenderPath == 14)
+        {
+            const uint32 pixelsPerGroup = ActiveWavefrontThreadGroupSize();
+            const uint32 maxGroups = Max<uint32>((uint32(rtTarget.Width()) * uint32(rtTarget.Height()) + pixelsPerGroup - 1) / pixelsPerGroup, 1);
+            effectiveGroups = Clamp<uint32>(effectiveGroups, 1, maxGroups);
         }
 
         g_persistent_worker_groups_actual = effectiveGroups;
@@ -2188,7 +2213,15 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
             long value = wcstol(commandLine, &end, 10);
             if(end != commandLine && value >= 1 && value <= 21)
                 g_commandLinePreset = int(value);
-            break;
+        }
+        else if(tokenLength == 7 && _wcsnicmp(tokenStart, L"-nframe", tokenLength) == 0)
+        {
+            while(*commandLine == L' ' || *commandLine == L'\t')
+                ++commandLine;
+            wchar* end = nullptr;
+            unsigned long long value = wcstoull(commandLine, &end, 10);
+            if(end != commandLine && value > 0)
+                g_commandLineNumFrames = uint64(value);
         }
     }
 

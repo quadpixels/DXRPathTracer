@@ -31,16 +31,25 @@
       const uint32 numPixels = width * height;
       const uint32 wavefrontThreadGroupSize = ActiveWavefrontThreadGroupSize();
       const uint32 pixelGroups = (numPixels + wavefrontThreadGroupSize - 1) / wavefrontThreadGroupSize;
-      const uint32 persistentGroups = Clamp<uint32>(uint32(g_persistent_worker_groups), 1, Max<uint32>(pixelGroups, 1));
+      const uint32 persistentGroups = Clamp<uint32>(uint32(g_persistent_worker_groups_actual), 1, Max<uint32>(pixelGroups, 1));
       const uint32 gx = (width + 7) / 8;
       const uint32 gy = (height + 7) / 8;
 
       rtConstants.myFlags = 16u;
+      if(g_persistent_tiled)
+      {
+          rtConstants.myFlags |= 128u;
+          if(g_persistent_tiled_order == 1)
+              rtConstants.myFlags |= 256u | 512u;
+          else if(g_persistent_tiled_order == 2)
+              rtConstants.myFlags |= 512u;
+      }
       rtConstants.WavefrontReadQueue = 0;
       rtConstants.WavefrontWriteQueue = 0;
       rtConstants.WavefrontBounce = 0;
       rtConstants.WavefrontPadding = Clamp<uint32>(uint32(g_persistent_batch_waves), 1, 8);
       rtConstants.WavefrontThreadGroupSize = wavefrontThreadGroupSize;
+      rtConstants.PersistentWorkerCount = persistentGroups * wavefrontThreadGroupSize;
       DX12::BindTempConstantBuffer(cmdList, rtConstants, RTParams_CBuffer, CmdListMode::Compute);
 
       {
