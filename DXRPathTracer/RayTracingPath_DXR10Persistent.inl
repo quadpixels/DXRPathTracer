@@ -37,8 +37,23 @@
           const uint64 workerCount = uint64(dispatchDesc.Width) * uint64(dispatchDesc.Height);
           const uint64 tileCountX = (uint64(rtTarget.Width()) + dispatchDesc.Width - 1) / dispatchDesc.Width;
           const uint64 tileCountY = (uint64(rtTarget.Height()) + dispatchDesc.Height - 1) / dispatchDesc.Height;
+          auto mortonDomainSize = [](uint64 width, uint64 height)
+          {
+              auto nextPowerOfTwo = [](uint64 value)
+              {
+                  uint64 result = 1;
+                  while(result < value)
+                      result <<= 1;
+                  return result;
+              };
+              return nextPowerOfTwo(width) * nextPowerOfTwo(height);
+          };
+          const bool zCurveTiles = tiledPersistentWarp && g_persistent_tiled_order == 1;
+          const bool zCurveLocal = tiledPersistentWarp && g_persistent_tiled_order != 0;
+          const uint64 tileWorkItemCount = zCurveTiles ? mortonDomainSize(tileCountX, tileCountY) : tileCountX * tileCountY;
+          const uint64 localWorkItemCount = zCurveLocal ? mortonDomainSize(dispatchDesc.Width, dispatchDesc.Height) : workerCount;
           const uint64 totalWorkItems = tiledPersistentWarp ?
-              tileCountX * tileCountY * workerCount :
+              tileWorkItemCount * localWorkItemCount :
               uint64(rtTarget.Width()) * uint64(rtTarget.Height());
           const uint32 dispatchCount = uint32((totalWorkItems + workerCount * maxRayGenIterations - 1) /
                                                (workerCount * maxRayGenIterations)) + 1;

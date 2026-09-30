@@ -1,7 +1,7 @@
     case 8:
     case 14: {
       const bool staticStridePersistentWarps = activeRenderPath == 14;
-      ProfileBlock pb(cmdList, staticStridePersistentWarps ? "Persistent Warps (Static Stride) Dispatch" : "Persistent Warps (Atomic Cursor) Dispatch");
+      ProfileBlock pb(cmdList, staticStridePersistentWarps ? "Persistent Warps (Static Stride) Dispatch" : "RayQuery Persistent Warps Dispatch");
 
       D3D12_CPU_DESCRIPTOR_HANDLE uavs[] =
       {

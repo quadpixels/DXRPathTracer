@@ -1,4 +1,5 @@
     case 7: {
+      ProfileBlock pb(cmdList, "RayQuery Persistent Wavefront Dispatch");
       D3D12_CPU_DESCRIPTOR_HANDLE uavs[] =
       {
           rtTarget.UAV,

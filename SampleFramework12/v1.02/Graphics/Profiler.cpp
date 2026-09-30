@@ -24,6 +24,8 @@ extern bool g_wavefront_skip_primary_sort;
 extern bool g_wavefront_block_sort;
 extern bool g_wavefront_wave_append;
 extern bool g_persistent_shadow_workers;
+extern bool g_persistent_tiled;
+extern int g_persistent_tiled_order;
 extern int g_render_path;
 extern int g_persistent_worker_groups;
 extern int g_persistent_batch_waves;
@@ -344,6 +346,73 @@ struct CurrentConfigMeasureState
 
 static CurrentConfigMeasureState CurrentConfigMeasure;
 
+struct RenderPathBenchmarkCase
+{
+    int RenderPath;
+    int TiledMode; // -1 = non-tiled, 0 = tiled linear, 1 = Z tile + local, 2 = Z local only
+    const char* Name;
+};
+
+static const RenderPathBenchmarkCase RenderPathBenchmarkCases[] =
+{
+    { 0,  -1, "DXR1.0 original" },
+    { 11, -1, "DXR1.0 persistent warp" },
+    { 13,  0, "DXR1.0 tiled persistent warp / linear" },
+    { 13,  1, "DXR1.0 tiled persistent warp / Ztile+Zlocal" },
+    { 13,  2, "DXR1.0 tiled persistent warp / Zlocal" },
+    { 15, -1, "DXR1.0 persistent warp atomic" },
+    { 16,  0, "DXR1.0 tiled persistent warp atomic / linear" },
+    { 16,  1, "DXR1.0 tiled persistent warp atomic / Ztile+Zlocal" },
+    { 16,  2, "DXR1.0 tiled persistent warp atomic / Zlocal" },
+    { 5,  -1, "DXR1.1 loop-based" },
+    { 9,  -1, "DXR1.1 GPU wavefront" },
+    { 7,  -1, "DXR1.1 persistent wavefront" },
+    { 7,   0, "DXR1.1 persistent wavefront / tiled linear" },
+    { 7,   1, "DXR1.1 persistent wavefront / tiled Ztile+Zlocal" },
+    { 7,   2, "DXR1.1 persistent wavefront / tiled Zlocal" },
+    { 8,  -1, "DXR1.1 persistent warps" },
+    { 8,   0, "DXR1.1 persistent warps / tiled linear" },
+    { 8,   1, "DXR1.1 persistent warps / tiled Ztile+Zlocal" },
+    { 8,   2, "DXR1.1 persistent warps / tiled Zlocal" },
+    { 14, -1, "DXR1.1 persistent warps static stride" },
+    { 14,  0, "DXR1.1 persistent warps static stride / tiled linear" },
+    { 14,  1, "DXR1.1 persistent warps static stride / tiled Ztile+Zlocal" },
+    { 14,  2, "DXR1.1 persistent warps static stride / tiled Zlocal" },
+    { 10, -1, "DXR1.1 persistent wavefront global queue" },
+    { 10,  0, "DXR1.1 persistent wavefront global queue / tiled linear" },
+    { 10,  1, "DXR1.1 persistent wavefront global queue / tiled Ztile+Zlocal" },
+    { 10,  2, "DXR1.1 persistent wavefront global queue / tiled Zlocal" },
+};
+
+struct RenderPathBenchmarkState
+{
+    bool Active = false;
+    bool Finished = false;
+    uint32 CaseIdx = 0;
+    uint32 ThreadGroupIdx = 0;
+    uint32 WorkerGroupIdx = 0;
+    uint32 WarmupFrames = 0;
+    uint32 SampleFrames = 0;
+    double SampleSum = 0.0;
+    int SavedRenderPath = 0;
+    int SavedThreadGroupSize = 64;
+    int SavedWorkerGroups = 1024;
+    bool SavedTiled = false;
+    int SavedTiledOrder = 0;
+    double WarmupStartTime = 0.0;
+    double WarmupElapsedTime = 0.0;
+    string Results;
+};
+
+static RenderPathBenchmarkState RenderPathBenchmark;
+static const uint32 RenderPathBenchmarkWarmupFrames = 10;
+static const uint32 RenderPathBenchmarkSampleFrames = 10;
+
+static bool RenderPathBenchmarkUsesThreadGroupConfig()
+{
+    return RenderPathBenchmarkCases[RenderPathBenchmark.CaseIdx].RenderPath != 0;
+}
+
 static double CurrentSecondsSinceEpoch() {
   auto now = std::chrono::system_clock::now();
   // Get duration since epoch in milliseconds
@@ -357,6 +426,165 @@ static void ApplyThreadGroupScanConfig()
     g_wavefront_thread_group_size = ThreadGroupScanThreadGroups[ThreadGroupScan.ThreadGroupIdx];
     g_persistent_worker_groups = ThreadGroupScanWorkerGroups[ThreadGroupScan.WorkerGroupIdx];
     ThreadGroupScan.WarmupStartTime = CurrentSecondsSinceEpoch();
+}
+
+static const char* RenderPathBenchmarkProfileName(const RenderPathBenchmarkCase& benchmarkCase)
+{
+    switch(benchmarkCase.RenderPath)
+    {
+    case 0:  return "TraceRay DispatchRays (original, recursive)";
+    case 11: return "TraceRay DispatchRays (DXR 1.0 Persistent Warp)";
+    case 13: return "TraceRay DispatchRays (DXR 1.0 Tiled Persistent Warp)";
+    case 15: return "TraceRay DispatchRays (DXR 1.0 Persistent Warp, Atomic)";
+    case 16: return "TraceRay DispatchRays (DXR 1.0 Tiled Persistent Warp, Atomic)";
+    case 5:  return "RayQuery Dispatch (loop)";
+    case 9:  return "RayQuery GPU Wavefront Dispatch";
+    case 7:  return "RayQuery Persistent Wavefront Dispatch";
+    case 8:  return "RayQuery Persistent Warps Dispatch";
+    case 14: return "Persistent Warps (Static Stride) Dispatch";
+    case 10: return "RayQuery Persistent Wavefront Global Queue Dispatch";
+    default: return nullptr;
+    }
+}
+
+static const char* RenderPathBenchmarkLayoutName(int tiledMode)
+{
+    if(tiledMode < 0)
+        return "none";
+    if(tiledMode == 0)
+        return "linear";
+    if(tiledMode == 1)
+        return "zcurve_tiles_and_local";
+    return "zcurve_local";
+}
+
+static void ApplyRenderPathBenchmarkConfig()
+{
+    const RenderPathBenchmarkCase& benchmarkCase = RenderPathBenchmarkCases[RenderPathBenchmark.CaseIdx];
+    g_render_path = benchmarkCase.RenderPath;
+    if(benchmarkCase.RenderPath != 0)
+    {
+        g_wavefront_thread_group_size = ThreadGroupScanThreadGroups[RenderPathBenchmark.ThreadGroupIdx];
+        g_persistent_worker_groups = ThreadGroupScanWorkerGroups[RenderPathBenchmark.WorkerGroupIdx];
+    }
+
+    g_persistent_tiled = benchmarkCase.TiledMode >= 0;
+    g_persistent_tiled_order = benchmarkCase.TiledMode >= 0 ? benchmarkCase.TiledMode : 0;
+    RenderPathBenchmark.WarmupStartTime = CurrentSecondsSinceEpoch();
+}
+
+static void BeginRenderPathBenchmark()
+{
+    RenderPathBenchmark = RenderPathBenchmarkState();
+    RenderPathBenchmark.Active = true;
+    RenderPathBenchmark.SavedRenderPath = g_render_path;
+    RenderPathBenchmark.SavedThreadGroupSize = g_wavefront_thread_group_size;
+    RenderPathBenchmark.SavedWorkerGroups = g_persistent_worker_groups;
+    RenderPathBenchmark.SavedTiled = g_persistent_tiled;
+    RenderPathBenchmark.SavedTiledOrder = g_persistent_tiled_order;
+    RenderPathBenchmark.Results = "Render Path Benchmark Results\r\n";
+    RenderPathBenchmark.Results += "render_path_name,render_path,layout,tg_size,num_tg,samples,dispatch_time_ms\r\n";
+    ApplyRenderPathBenchmarkConfig();
+}
+
+static void RestoreRenderPathBenchmarkConfig()
+{
+    g_render_path = RenderPathBenchmark.SavedRenderPath;
+    g_wavefront_thread_group_size = RenderPathBenchmark.SavedThreadGroupSize;
+    g_persistent_worker_groups = RenderPathBenchmark.SavedWorkerGroups;
+    g_persistent_tiled = RenderPathBenchmark.SavedTiled;
+    g_persistent_tiled_order = RenderPathBenchmark.SavedTiledOrder;
+}
+
+static void FinishRenderPathBenchmark()
+{
+    RenderPathBenchmark.Active = false;
+    RenderPathBenchmark.Finished = true;
+    RestoreRenderPathBenchmarkConfig();
+    OutputDebugStringA(RenderPathBenchmark.Results.c_str());
+    WriteLog("%s", RenderPathBenchmark.Results.c_str());
+}
+
+static void CancelRenderPathBenchmark()
+{
+    RenderPathBenchmark.Active = false;
+    RestoreRenderPathBenchmarkConfig();
+}
+
+static void UpdateRenderPathBenchmark(const Array<ProfileData>& profiles, uint64 numProfiles,
+                                      const uint64* frameQueryData, uint64 gpuFrequency)
+{
+    if(RenderPathBenchmark.Active == false)
+        return;
+
+    const RenderPathBenchmarkCase& benchmarkCase = RenderPathBenchmarkCases[RenderPathBenchmark.CaseIdx];
+    const char* profileName = RenderPathBenchmarkProfileName(benchmarkCase);
+    const double seconds = CurrentSecondsSinceEpoch();
+    RenderPathBenchmark.WarmupElapsedTime = seconds - RenderPathBenchmark.WarmupStartTime;
+
+    if(RenderPathBenchmark.WarmupFrames < RenderPathBenchmarkWarmupFrames &&
+       RenderPathBenchmark.WarmupElapsedTime <= ThreadGroupScanWarmupSeconds)
+    {
+        ++RenderPathBenchmark.WarmupFrames;
+        return;
+    }
+
+    const double frameTime = profileName == nullptr ? 0.0 :
+        CurrentFrameProfileTimeByName(profiles, numProfiles, frameQueryData, gpuFrequency, profileName);
+    if(frameTime <= 0.0)
+        return;
+
+    RenderPathBenchmark.SampleSum += frameTime;
+    ++RenderPathBenchmark.SampleFrames;
+    if(RenderPathBenchmark.SampleFrames < RenderPathBenchmarkSampleFrames)
+        return;
+
+    const double averageTime = RenderPathBenchmark.SampleSum / double(RenderPathBenchmark.SampleFrames);
+    char line[512] = { };
+    if(benchmarkCase.RenderPath == 0)
+    {
+        sprintf_s(line, "%s,%d,%s,0,0,%u,%.4f\r\n",
+                  benchmarkCase.Name, benchmarkCase.RenderPath,
+                  RenderPathBenchmarkLayoutName(benchmarkCase.TiledMode),
+                  RenderPathBenchmark.SampleFrames, averageTime);
+    }
+    else
+    {
+        sprintf_s(line, "%s,%d,%s,%d,%d,%u,%.4f\r\n",
+                  benchmarkCase.Name, benchmarkCase.RenderPath,
+                  RenderPathBenchmarkLayoutName(benchmarkCase.TiledMode),
+                  ThreadGroupScanThreadGroups[RenderPathBenchmark.ThreadGroupIdx],
+                  ThreadGroupScanWorkerGroups[RenderPathBenchmark.WorkerGroupIdx],
+                  RenderPathBenchmark.SampleFrames, averageTime);
+    }
+    RenderPathBenchmark.Results += line;
+
+    RenderPathBenchmark.SampleSum = 0.0;
+    RenderPathBenchmark.SampleFrames = 0;
+    RenderPathBenchmark.WarmupFrames = 0;
+    if(benchmarkCase.RenderPath == 0)
+    {
+        ++RenderPathBenchmark.CaseIdx;
+    }
+    else
+    {
+        ++RenderPathBenchmark.WorkerGroupIdx;
+        if(RenderPathBenchmark.WorkerGroupIdx >= ArraySize_(ThreadGroupScanWorkerGroups))
+        {
+            RenderPathBenchmark.WorkerGroupIdx = 0;
+            ++RenderPathBenchmark.ThreadGroupIdx;
+        }
+        if(RenderPathBenchmark.ThreadGroupIdx >= ArraySize_(ThreadGroupScanThreadGroups))
+        {
+            RenderPathBenchmark.ThreadGroupIdx = 0;
+            ++RenderPathBenchmark.CaseIdx;
+        }
+    }
+
+    if(RenderPathBenchmark.CaseIdx >= ArraySize_(RenderPathBenchmarkCases))
+        FinishRenderPathBenchmark();
+    else
+        ApplyRenderPathBenchmarkConfig();
 }
 
 static void BeginThreadGroupScan()
@@ -860,6 +1088,7 @@ void Profiler::EndFrame(uint32 displayWidth, uint32 displayHeight)
 
     UpdateThreadGroupScan(profiles, numProfiles, frameQueryData, gpuFrequency);
     UpdateCurrentConfigMeasure(profiles, numProfiles, frameQueryData, gpuFrequency);
+    UpdateRenderPathBenchmark(profiles, numProfiles, frameQueryData, gpuFrequency);
 
     // Iterate over all of the profiles
     for(uint64 profileIdx = 0; profileIdx < numProfiles; ++profileIdx)
@@ -890,7 +1119,35 @@ void Profiler::EndFrame(uint32 displayWidth, uint32 displayHeight)
         }
 
         ImGui::Text(" ");
-        if(ThreadGroupScan.Active)
+        if(RenderPathBenchmark.Active)
+        {
+            const RenderPathBenchmarkCase& benchmarkCase = RenderPathBenchmarkCases[RenderPathBenchmark.CaseIdx];
+            if(RenderPathBenchmarkUsesThreadGroupConfig())
+            {
+                ImGui::Text("Render path benchmark: %u/%u, %s, tg=%d num_tg=%d warmup=%u/%ufr, %.1f/%.1fs samples=%u/%u",
+                            RenderPathBenchmark.CaseIdx + 1,
+                            uint32(ArraySize_(RenderPathBenchmarkCases)),
+                            benchmarkCase.Name,
+                            ThreadGroupScanThreadGroups[RenderPathBenchmark.ThreadGroupIdx],
+                            ThreadGroupScanWorkerGroups[RenderPathBenchmark.WorkerGroupIdx],
+                            RenderPathBenchmark.WarmupFrames, RenderPathBenchmarkWarmupFrames,
+                            RenderPathBenchmark.WarmupElapsedTime, ThreadGroupScanWarmupSeconds,
+                            RenderPathBenchmark.SampleFrames, RenderPathBenchmarkSampleFrames);
+            }
+            else
+            {
+                ImGui::Text("Render path benchmark: %u/%u, %s, tg=n/a num_tg=n/a warmup=%u/%ufr, %.1f/%.1fs samples=%u/%u",
+                            RenderPathBenchmark.CaseIdx + 1,
+                            uint32(ArraySize_(RenderPathBenchmarkCases)),
+                            benchmarkCase.Name,
+                            RenderPathBenchmark.WarmupFrames, RenderPathBenchmarkWarmupFrames,
+                            RenderPathBenchmark.WarmupElapsedTime, ThreadGroupScanWarmupSeconds,
+                            RenderPathBenchmark.SampleFrames, RenderPathBenchmarkSampleFrames);
+            }
+            if(ImGui::Button("Cancel Render Path Benchmark"))
+                CancelRenderPathBenchmark();
+        }
+        else if(ThreadGroupScan.Active)
         {
             ImGui::Text("Thread group scan: tg=%d num_tg=%d warmup=%u/%ufr,%.1f/%.1fs samples=%u/%u",
                         ThreadGroupScanThreadGroups[ThreadGroupScan.ThreadGroupIdx],
@@ -916,7 +1173,7 @@ void Profiler::EndFrame(uint32 displayWidth, uint32 displayHeight)
             if(ImGui::Button("Cancel Current Config Measurement"))
                 CancelCurrentConfigMeasure();
         }
-        else
+        else if(CurrentConfigMeasure.Active == false)
         {
             if(ImGui::Button("Scan Thread Groups"))
                 BeginThreadGroupScan();
@@ -925,11 +1182,29 @@ void Profiler::EndFrame(uint32 displayWidth, uint32 displayHeight)
             if(ImGui::Button("Measure Current Config (20 samples)"))
                 BeginCurrentConfigMeasure();
 
+            ImGui::SameLine();
+            if(ImGui::Button("Benchmark Render Paths"))
+                BeginRenderPathBenchmark();
+
             if(ThreadGroupScan.Finished)
             {
                 ImGui::SameLine();
                 ImGui::Text("scan complete");
             }
+        }
+
+        if(RenderPathBenchmark.Results.empty() == false)
+        {
+            ImGui::Text("Render Path Benchmark Results");
+            ImGui::SameLine();
+            if(ImGui::Button("Copy Render Benchmark Results"))
+                ImGui::SetClipboardText(RenderPathBenchmark.Results.c_str());
+
+            ImGui::InputTextMultiline("##RenderPathBenchmarkResults",
+                                      const_cast<char*>(RenderPathBenchmark.Results.c_str()),
+                                      RenderPathBenchmark.Results.size() + 1,
+                                      ImVec2(-1.0f, ImGui::GetTextLineHeight() * 12.0f),
+                                      ImGuiInputTextFlags_ReadOnly);
         }
 
         if(ThreadGroupScan.Results.empty() == false)
@@ -968,7 +1243,7 @@ void Profiler::EndFrame(uint32 displayWidth, uint32 displayHeight)
     if(enableGPUProfiling)
         readbackBuffer.Unmap();
 
-    enableGPUProfiling = showUI || ThreadGroupScan.Active || CurrentConfigMeasure.Active;
+    enableGPUProfiling = showUI || ThreadGroupScan.Active || CurrentConfigMeasure.Active || RenderPathBenchmark.Active;
 }
 
 double Profiler::GPUProfileTiming(const char* name) const
